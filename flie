@@ -1,0 +1,2281 @@
+import * as THREE from 'three';
+import * as TWEEN from "three/examples/jsm/libs/tween.module.js"
+import {OrbitControls} from 'three/examples/jsm/controls/OrbitControls'
+
+import Stats from "three/examples/jsm/libs/stats.module.js";
+import {Octree} from "three/examples/jsm/math/Octree"
+import {Capsule} from "three/examples/jsm/math/Capsule";
+import {GLTFLoader} from "three/examples/jsm/loaders/GLTFLoader.js";
+import {OctreeHelper} from "three/examples/jsm/helpers/OctreeHelper"
+// 导入表格对话框工具
+import tableDialog from '../showDialog'
+
+// 辽宁省行政区划数据 - 市及其辖区（修复：添加完整路径和所属城市）
+const liaoningCities = [
+  {
+    name: "沈阳市",
+    districts: [
+      { name: "和平区", path: "沈阳市/和平区", parentCity: "沈阳市" },
+      { name: "沈河区", path: "沈阳市/沈河区", parentCity: "沈阳市" },
+      { name: "大东区", path: "沈阳市/大东区", parentCity: "沈阳市" },
+      { name: "皇姑区", path: "沈阳市/皇姑区", parentCity: "沈阳市" },
+      { name: "铁西区", path: "沈阳市/铁西区", parentCity: "沈阳市" },
+      { name: "苏家屯区", path: "沈阳市/苏家屯区", parentCity: "沈阳市" },
+      { name: "浑南区", path: "沈阳市/浑南区", parentCity: "沈阳市" },
+      { name: "沈北新区", path: "沈阳市/沈北新区", parentCity: "沈阳市" },
+      { name: "于洪区", path: "沈阳市/于洪区", parentCity: "沈阳市" },
+      { name: "辽中区", path: "沈阳市/辽中区", parentCity: "沈阳市" }
+    ]
+  },
+  {
+    name: "大连市",
+    districts: [
+      { name: "中山区", path: "大连市/中山区", parentCity: "大连市" },
+      { name: "西岗区", path: "大连市/西岗区", parentCity: "大连市" },
+      { name: "沙河口区", path: "大连市/沙河口区", parentCity: "大连市" },
+      { name: "甘井子区", path: "大连市/甘井子区", parentCity: "大连市" },
+      { name: "旅顺口区", path: "大连市/旅顺口区", parentCity: "大连市" },
+      { name: "金州区", path: "大连市/金州区", parentCity: "大连市" },
+      { name: "普兰店区", path: "大连市/普兰店区", parentCity: "大连市" }
+    ]
+  },
+  {
+    name: "鞍山市",
+    districts: [
+      { name: "铁东区", path: "鞍山市/铁东区", parentCity: "鞍山市" },
+      { name: "铁西区", path: "鞍山市/铁西区", parentCity: "鞍山市" }, // 与沈阳同名的区
+      { name: "立山区", path: "鞍山市/立山区", parentCity: "鞍山市" },
+      { name: "千山区", path: "鞍山市/千山区", parentCity: "鞍山市" }
+    ]
+  },
+  {
+    name: "抚顺市",
+    districts: [
+      { name: "新抚区", path: "抚顺市/新抚区", parentCity: "抚顺市" },
+      { name: "东洲区", path: "抚顺市/东洲区", parentCity: "抚顺市" },
+      { name: "望花区", path: "抚顺市/望花区", parentCity: "抚顺市" },
+      { name: "顺城区", path: "抚顺市/顺城区", parentCity: "抚顺市" }
+    ]
+  },
+  {
+    name: "本溪市",
+    districts: [
+      { name: "平山区", path: "本溪市/平山区", parentCity: "本溪市" },
+      { name: "溪湖区", path: "本溪市/溪湖区", parentCity: "本溪市" },
+      { name: "明山区", path: "本溪市/明山区", parentCity: "本溪市" },
+      { name: "南芬区", path: "本溪市/南芬区", parentCity: "本溪市" }
+    ]
+  },
+  {
+    name: "丹东市",
+    districts: [
+      { name: "元宝区", path: "丹东市/元宝区", parentCity: "丹东市" },
+      { name: "振兴区", path: "丹东市/振兴区", parentCity: "丹东市" },
+      { name: "振安区", path: "丹东市/振安区", parentCity: "丹东市" }
+    ]
+  },
+  {
+    name: "锦州市",
+    districts: [
+      { name: "古塔区", path: "锦州市/古塔区", parentCity: "锦州市" },
+      { name: "凌河区", path: "锦州市/凌河区", parentCity: "锦州市" },
+      { name: "太和区", path: "锦州市/太和区", parentCity: "锦州市" }
+    ]
+  },
+  {
+    name: "营口市",
+    districts: [
+      { name: "站前区", path: "营口市/站前区", parentCity: "营口市" },
+      { name: "西市区", path: "营口市/西市区", parentCity: "营口市" },
+      { name: "鲅鱼圈区", path: "营口市/鲅鱼圈区", parentCity: "营口市" },
+      { name: "老边区", path: "营口市/老边区", parentCity: "营口市" }
+    ]
+  },
+  {
+    name: "阜新市",
+    districts: [
+      { name: "海州区", path: "阜新市/海州区", parentCity: "阜新市" },
+      { name: "新邱区", path: "阜新市/新邱区", parentCity: "阜新市" },
+      { name: "太平区", path: "阜新市/太平区", parentCity: "阜新市" },
+      { name: "清河门区", path: "阜新市/清河门区", parentCity: "阜新市" },
+      { name: "细河区", path: "阜新市/细河区", parentCity: "阜新市" }
+    ]
+  },
+  {
+    name: "辽阳市",
+    districts: [
+      { name: "白塔区", path: "辽阳市/白塔区", parentCity: "辽阳市" },
+      { name: "文圣区", path: "辽阳市/文圣区", parentCity: "辽阳市" },
+      { name: "宏伟区", path: "辽阳市/宏伟区", parentCity: "辽阳市" },
+      { name: "弓长岭区", path: "辽阳市/弓长岭区", parentCity: "辽阳市" },
+      { name: "太子河区", path: "辽阳市/太子河区", parentCity: "辽阳市" }
+    ]
+  },
+  {
+    name: "盘锦市",
+    districts: [
+      { name: "双台子区", path: "盘锦市/双台子区", parentCity: "盘锦市" },
+      { name: "兴隆台区", path: "盘锦市/兴隆台区", parentCity: "盘锦市" },
+      { name: "大洼区", path: "盘锦市/大洼区", parentCity: "盘锦市" }
+    ]
+  },
+  {
+    name: "铁岭市",
+    districts: [
+      { name: "银州区", path: "铁岭市/银州区", parentCity: "铁岭市" },
+      { name: "清河区", path: "铁岭市/清河区", parentCity: "铁岭市" }
+    ]
+  },
+  {
+    name: "朝阳市",
+    districts: [
+      { name: "双塔区", path: "朝阳市/双塔区", parentCity: "朝阳市" },
+      { name: "龙城区", path: "朝阳市/龙城区", parentCity: "朝阳市" }
+    ]
+  },
+  {
+    name: "葫芦岛市",
+    districts: [
+      { name: "连山区", path: "葫芦岛市/连山区", parentCity: "葫芦岛市" },
+      { name: "龙港区", path: "葫芦岛市/龙港区", parentCity: "葫芦岛市" },
+      { name: "南票区", path: "葫芦岛市/南票区", parentCity: "葫芦岛市" }
+    ]
+  }
+];
+
+const controls = {
+  posX: 200,
+  posY: 200,
+  posZ: 200
+};
+
+// 场景整体上移的偏移量
+const SCENE_Y_OFFSET = 0;
+
+// 房间尺寸和档案柜布局参数
+const ROOM_SIZE = 700;          // 房间大小
+const CABINET_SPACING = 2;      // 档案柜之间的间距
+const DOOR_WIDTH = 200;         // 门口宽度
+
+
+
+const Archive3D = {
+  init: function (canvasContainer, onJump) {
+    this.onJump = onJump; // 保存回调
+    this.Colors = {
+      red: 0xf25346,
+      white: 0xd8d0d1,
+      brown: 0x8b4513,
+      gray: 0x696969,
+      blue: 0x1e3a8a,
+      gold: 0xffd700,
+      black: 0x000000,
+      wall: 0xaaaaaa,
+      highlight: 0xffff00 // 高亮颜色
+    };
+    this.archiveLocked = false;
+    this.Event = {};
+    this.archives = [];
+    this.cabinets = [];
+    this.labels = [];
+    this.container = canvasContainer || document.body;
+    this.clock = new THREE.Clock();
+
+    // 初始化状态变量
+    this.actionIF = false;
+    this.activeCamera = null;
+    this.isLock = false;
+    this.bookLocked = false;
+    this.lastActiveCamera = null; // 用于存储搜索前的相机状态
+
+    // 搜索框焦点状态和键盘启用状态
+    this.isSearchFocused = false;
+    this.isKeyboardEnabled = true;
+
+    // 使射线检测失效
+    this.ifRaycasterEffect = true;
+
+    // 创建鼠标锁定指示器
+    this.createCursorIndicator();
+    this.centerCursorIndicator();
+
+    // 创建搜索框
+    this.createSearchBox();
+
+    // 八叉树碰撞检测
+    this.group = new THREE.Group();
+    this.worldOctree = new Octree();
+
+    // 物理相关参数
+    this.gravity = -39.8;
+    this.playerVelocity = new THREE.Vector3(0, 0, 0);
+    this.playerDirection = new THREE.Vector3(0, 0, 0);
+    this.playerOnFloor = false;
+
+    // 键盘状态
+    this.keyStates = {
+      KeyW: false,
+      KeyA: false,
+      KeyS: false,
+      KeyD: false,
+      Space: false,
+      KeyT: false,
+      KeyV: false,
+      KeyB: false, // 返回上一个相机
+      KeyF: false, // F键返回原视图
+      isDown: false,
+    };
+
+    // 鼠标移动是否可以转动视野   展示表格信息时
+    this.ifTurn = true;
+
+    // 创建场景
+    this.createScene();
+    // 添加坐标辅助器
+    this.addAxesHelper();
+    // 创建光线
+    this.createLights();
+    // 绘制墙壁
+    this.drawWalls();
+    // 加载机器人模型
+    this.addRobot();
+    // 绘制档案柜和档案
+    this.draw();
+
+    this.scene.add(this.group);
+
+    // 设置碰撞检测 八叉树分割
+    this.worldOctree.fromGraphNode(this.group);
+
+    // 初始化相机 - 默认使用上帝视角
+    this.activeCamera = this.cameraDefault;
+
+    // 强制触发一次尺寸调整
+    this.handleWindowResize();
+
+    // 添加事件监听
+    this.addEvent();
+
+    // 创建操作提示
+    this.createRelativeControlsHint();
+
+    // 开始动画循环
+    this.loop();
+  },
+
+  // 创建搜索框
+  createSearchBox: function() {
+    // 确保容器有相对定位
+    if (getComputedStyle(this.container).position === 'static') {
+      this.container.style.position = 'relative';
+    }
+
+    // 创建搜索框容器
+    this.searchContainer = document.createElement('div');
+    this.searchContainer.id = 'search-container';
+    this.searchContainer.style.cssText = `
+      position: absolute;
+      top: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 20;
+      display: flex;
+      align-items: center;
+      width: 80%;
+      max-width: 600px;
+    `;
+
+    // 创建搜索输入框
+    this.searchInput = document.createElement('input');
+    this.searchInput.type = 'text';
+    this.searchInput.placeholder = '搜索城市或区域（例如：沈阳 铁西 或 鞍山市/铁西区）';
+    this.searchInput.style.cssText = `
+      width: 100%;
+      padding: 12px 20px;
+      border: none;
+      border-radius: 30px 0 0 30px;
+      font-size: 16px;
+      outline: none;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    `;
+
+    // 创建搜索按钮
+    this.searchButton = document.createElement('button');
+    this.searchButton.textContent = '搜索';
+    this.searchButton.style.cssText = `
+      padding: 5px 24px;
+      background-color: #1e3a8a;
+      color: white;
+      border: none;
+      border-radius: 0 30px 30px 0;
+      font-size: 16px;
+      cursor: pointer;
+      transition: background-color 0.3s;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    `;
+    this.searchButton.addEventListener('mouseover', () => {
+      this.searchButton.style.backgroundColor = '#2d4b9e';
+    });
+    this.searchButton.addEventListener('mouseout', () => {
+      this.searchButton.style.backgroundColor = '#1e3a8a';
+    });
+
+    // 搜索结果下拉框
+    this.searchResults = document.createElement('div');
+    this.searchResults.id = 'search-results';
+    this.searchResults.style.cssText = `
+      position: absolute;
+      top: 100%;
+      left: 0;
+      right: 0;
+      background-color: white;
+      border-radius: 0 0 10px 10px;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+      max-height: 0;
+      overflow: hidden;
+      transition: max-height 0.3s ease;
+      z-index: 30;
+    `;
+
+    // 歧义选择对话框
+    this.ambiguityDialog = document.createElement('div');
+    this.ambiguityDialog.id = 'ambiguity-dialog';
+    this.ambiguityDialog.style.cssText = `
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      background-color: white;
+      border-radius: 10px;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);
+      padding: 20px;
+      z-index: 100;
+      display: none;
+      max-width: 500px;
+      width: 90%;
+    `;
+    this.ambiguityDialog.innerHTML = `
+      <h3 style="margin-top: 0; color: #333;">找到多个匹配结果</h3>
+      <p style="color: #666;">请选择您要查找的区域：</p>
+      <div id="ambiguity-options" style="margin: 15px 0;"></div>
+      <div style="display: flex; justify-content: flex-end; gap: 10px;">
+        <button id="cancel-ambiguity" style="padding: 8px 16px; border: 1px solid #ddd; border-radius: 4px; cursor: pointer;">取消</button>
+      </div>
+    `;
+
+    // 组装搜索框
+    this.searchContainer.appendChild(this.searchInput);
+    this.searchContainer.appendChild(this.searchButton);
+    this.searchContainer.appendChild(this.searchResults);
+    this.container.appendChild(this.searchContainer);
+    this.container.appendChild(this.ambiguityDialog);
+
+    // 添加搜索事件
+    this.searchButton.addEventListener('click', () => this.performSearch());
+    this.searchInput.addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') this.performSearch();
+    });
+    this.searchInput.addEventListener('input', () => this.handleSearchInput());
+
+    // 搜索框焦点事件
+    this.searchInput.addEventListener('focus', () => {
+      this.isSearchFocused = true;
+      this.isKeyboardEnabled = false;
+      // 隐藏操作提示
+      const controlsHint = document.getElementById('controls-hint');
+      if (controlsHint) controlsHint.style.opacity = '0.3';
+    });
+
+    this.searchInput.addEventListener('blur', () => {
+      this.isSearchFocused = false;
+      this.isKeyboardEnabled = true;
+      // 恢复操作提示
+      const controlsHint = document.getElementById('controls-hint');
+      if (controlsHint) controlsHint.style.opacity = '1';
+    });
+
+    // 歧义选择对话框取消按钮
+    document.getElementById('cancel-ambiguity').addEventListener('click', () => {
+      this.ambiguityDialog.style.display = 'none';
+      this.ifTurn = true;
+      this.isSearchFocused = false;
+    });
+  },
+
+  // 处理搜索输入（实时建议）
+  handleSearchInput: function() {
+    const query = this.searchInput.value.trim().toLowerCase();
+    if (query.length < 1) {
+      this.searchResults.style.maxHeight = '0';
+      return;
+    }
+
+    // 清空之前的结果
+    this.searchResults.innerHTML = '';
+
+    // 搜索匹配的城市和区域
+    const matches = [];
+
+    // 搜索城市
+    liaoningCities.forEach(city => {
+      if (city.name.toLowerCase().includes(query)) {
+        matches.push({
+          type: 'city',
+          name: city.name,
+          parent: null,
+          path: city.name
+        });
+      }
+
+      // 搜索区域
+      city.districts.forEach(district => {
+        const districtName = district.name.toLowerCase();
+        const cityName = city.name.toLowerCase();
+
+        // 匹配规则：
+        // 1. 区域名包含查询词
+        // 2. 城市名+区域名组合包含查询词
+        // 3. 完整路径包含查询词
+        if (districtName.includes(query) ||
+          `${cityName}${districtName}`.includes(query) ||
+          district.path.toLowerCase().includes(query)) {
+          matches.push({
+            type: 'district',
+            name: district.name,
+            parent: city.name,
+            path: district.path
+          });
+        }
+      });
+    });
+
+    // 去重并限制结果数量
+    const uniqueMatches = Array.from(new Map(matches.map(item => [item.path, item])).values());
+    const limitedMatches = uniqueMatches.slice(0, 8);
+
+    // 显示结果
+    if (limitedMatches.length > 0) {
+      limitedMatches.forEach(match => {
+        const resultItem = document.createElement('div');
+        resultItem.style.cssText = `
+          padding: 10px 20px;
+          cursor: pointer;
+          transition: background-color 0.2s;
+        `;
+        resultItem.innerHTML = match.type === 'city'
+          ? `<strong>${match.name}</strong> (城市)`
+          : `${match.name} <span style="color:#666; font-size:0.9em;">属于 ${match.parent}</span>`;
+
+        resultItem.addEventListener('mouseover', () => {
+          resultItem.style.backgroundColor = '#f0f0f0';
+        });
+        resultItem.addEventListener('mouseout', () => {
+          resultItem.style.backgroundColor = 'transparent';
+        });
+        resultItem.addEventListener('click', () => {
+          this.searchInput.value = match.path.includes('/') ? match.name : match.path;
+          this.searchResults.style.maxHeight = '0';
+          this.performSearch();
+        });
+
+        this.searchResults.appendChild(resultItem);
+      });
+
+      this.searchResults.style.maxHeight = `${limitedMatches.length * 40 + 10}px`;
+    } else {
+      const noResult = document.createElement('div');
+      noResult.style.padding = '10px 20px';
+      noResult.textContent = '没有找到匹配的结果';
+      this.searchResults.appendChild(noResult);
+      this.searchResults.style.maxHeight = '50px';
+    }
+  },
+
+  // 执行搜索
+  performSearch: function() {
+    const query = this.searchInput.value.trim();
+    if (!query) return;
+
+    // 关闭搜索结果下拉框
+    this.searchResults.style.maxHeight = '0';
+
+    // 重置所有高亮
+    this.resetHighlights();
+
+    // 查找匹配的城市和区域
+    const matches = this.findMatches(query);
+
+    if (matches.length === 0) {
+      this.showSearchNotification('未找到匹配的城市或区域');
+      this.lastActiveCamera = null;
+    } else if (matches.length === 1) {
+      // 唯一匹配结果
+      this.handleSingleMatch(matches[0]);
+    } else {
+      // 多个匹配结果（处理歧义）
+      this.ifTurn = false;
+      this.isSearchFocused = true;
+      this.handleMultipleMatches(matches);
+    }
+  },
+
+  // 查找匹配项
+  findMatches: function(query) {
+    const lowerQuery = query.toLowerCase();
+    const matches = [];
+
+    // 精确匹配完整路径（最高优先级）
+    if (lowerQuery.includes('/')) {
+      liaoningCities.forEach(city => {
+        city.districts.forEach(district => {
+          if (district.path.toLowerCase() === lowerQuery) {
+            matches.push(district);
+          }
+        });
+      });
+
+      if (matches.length > 0) {
+        return matches;
+      }
+    }
+
+    // 解析查询中的城市和区域部分
+    let cityPart = '';
+    let districtPart = lowerQuery;
+
+    // 尝试按空格分割城市和区域
+    const parts = lowerQuery.split(' ');
+    if (parts.length >= 2) {
+      cityPart = parts[0];
+      districtPart = parts.slice(1).join(' ');
+    }
+
+    // 搜索匹配的区域
+    liaoningCities.forEach(city => {
+      // 检查城市是否匹配
+      const cityMatches = city.name.toLowerCase().includes(cityPart);
+
+      city.districts.forEach(district => {
+        const districtMatches = district.name.toLowerCase().includes(districtPart);
+
+        // 同时匹配城市和区域，或仅匹配区域
+        if ((cityMatches && districtMatches) ||
+          district.name.toLowerCase() === lowerQuery) {
+          matches.push(district);
+        }
+      });
+    });
+
+    // 如果没有找到区域匹配，尝试匹配城市
+    if (matches.length === 0) {
+      liaoningCities.forEach(city => {
+        if (city.name.toLowerCase().includes(lowerQuery)) {
+          matches.push({
+            type: 'city',
+            name: city.name,
+            path: city.name,
+            parentCity: null
+          });
+        }
+      });
+    }
+
+    return matches;
+  },
+
+  // 处理唯一匹配结果
+  handleSingleMatch: function(match) {
+    // 保存默认相机状态，以便稍后返回
+    this.lastActiveCamera = this.cameraDefault;
+
+    if (match.type === 'city') {
+      // 匹配到城市
+      const cabinet = this.cabinets.find(c => c.cityName === match.name);
+      if (cabinet) {
+        this.highlightCabinet(cabinet);
+        this.focusOnObjectWithSearchCamera(cabinet);
+        this.showSearchNotification(`已定位到城市: ${match.name} (按F键返回原视图)`);
+      }
+    } else {
+      // 匹配到区域
+      const archive = this.archives.find(a => a.districtInfo && a.districtInfo.path === match.path);
+      if (archive) {
+        this.highlightArchive(archive);
+        // 获取档案所在的档案柜
+        let cabinet = archive;
+        while (cabinet.parent && !cabinet.cityName) {
+          cabinet = cabinet.parent;
+        }
+        this.focusOnObjectWithSearchCamera(archive, cabinet);
+        this.showSearchNotification(`已定位到: ${match.path} (按F键返回原视图)`);
+      }
+    }
+  },
+
+  // 处理多个匹配结果（歧义处理）
+  handleMultipleMatches: function(matches) {
+    const optionsContainer = document.getElementById('ambiguity-options');
+    optionsContainer.innerHTML = '';
+
+
+
+    // 显示歧义选择对话框
+    matches.forEach(match => {
+      const optionBtn = document.createElement('button');
+      optionBtn.style.cssText = `
+        width: 100%;
+        padding: 10px;
+        margin-bottom: 8px;
+        text-align: left;
+        background-color: #f9f9f9;
+        border: 1px solid #eee;
+        border-radius: 4px;
+        cursor: pointer;
+        transition: all 0.2s;
+      `;
+      optionBtn.innerHTML = match.path.includes('/') ?
+        `${match.name} <span style="color:#666; font-size:0.9em;">(${match.parentCity})</span>` :
+        `<strong>${match.name}</strong> <span style="color:#666; font-size:0.9em;">(城市)</span>`;
+
+      optionBtn.addEventListener('mouseover', () => {
+        optionBtn.style.backgroundColor = '#f0f0f0';
+        optionBtn.style.borderColor = '#ddd';
+      });
+
+      optionBtn.addEventListener('mouseout', () => {
+        optionBtn.style.backgroundColor = '#f9f9f9';
+        optionBtn.style.borderColor = '#eee';
+      });
+
+      optionBtn.addEventListener('click', () => {
+        this.ambiguityDialog.style.display = 'none';
+        this.isSearchFocused = false;
+        this.handleSingleMatch(match);
+      });
+
+      optionsContainer.appendChild(optionBtn);
+    });
+
+    this.ambiguityDialog.style.display = 'block';
+  },
+
+  // 高亮档案柜
+  highlightCabinet: function(cabinet) {
+    // 保存原始材质
+    if (!cabinet.originalMaterials) {
+      cabinet.originalMaterials = [];
+      cabinet.traverse(child => {
+        if (child.isMesh) {
+          cabinet.originalMaterials.push({
+            object: child,
+            material: child.material
+          });
+        }
+      });
+    }
+
+    // 应用高亮材质
+    const highlightMaterial = new THREE.MeshPhongMaterial({
+      color: this.Colors.highlight,
+      shininess: 50,
+      emissive: 0xffff00,
+      emissiveIntensity: 0.3
+    });
+
+    cabinet.traverse(child => {
+      if (child.isMesh) {
+        child.material = highlightMaterial;
+      }
+    });
+
+    // 5秒后取消高亮
+    setTimeout(() => this.resetHighlights(), 3000);
+  },
+
+  // 高亮档案
+  highlightArchive: function(archive) {
+    // 保存原始材质
+    if (!archive.originalMaterials) {
+      archive.originalMaterials = [];
+      archive.traverse(child => {
+        if (child.isMesh) {
+          archive.originalMaterials.push({
+            object: child,
+            material: child.material
+          });
+        }
+      });
+    }
+
+    // 应用高亮材质
+    const highlightMaterial = new THREE.MeshPhongMaterial({
+      color: this.Colors.highlight,
+      shininess: 50,
+      emissive: 0xffff00,
+      emissiveIntensity: 0.1
+    });
+
+    archive.traverse(child => {
+      if (child.isMesh) {
+        child.material = highlightMaterial;
+      }
+    });
+
+    // 5秒后取消高亮
+    setTimeout(() => this.resetHighlights(), 3000);
+  },
+
+  // 重置所有高亮
+  resetHighlights: function() {
+    // 重置档案柜
+    this.cabinets.forEach(cabinet => {
+      if (cabinet.originalMaterials) {
+        cabinet.originalMaterials.forEach(item => {
+          item.object.material = item.material;
+        });
+        cabinet.originalMaterials = null;
+      }
+    });
+
+    // 重置档案
+    this.archives.forEach(archive => {
+      if (archive.originalMaterials) {
+        archive.originalMaterials.forEach(item => {
+          item.object.material = item.material;
+        });
+        archive.originalMaterials = null;
+      }
+    });
+  },
+
+  // 判断物体所在的墙
+  getWallLocation: function(object) {
+    // 获取物体世界位置
+    const worldPos = new THREE.Vector3();
+    object.getWorldPosition(worldPos);
+
+    // 定义边界阈值
+    const wallThreshold = ROOM_SIZE / 2 - 50; // 离墙的距离阈值
+
+    // 判断是否在左墙
+    if (worldPos.x <= -wallThreshold) {
+      return 'left';
+    }
+    // 判断是否在右墙
+    else if (worldPos.x >= wallThreshold) {
+      return 'right';
+    }
+    // 判断是否在后墙
+    else if (worldPos.z <= -wallThreshold) {
+      return 'back';
+    }
+    // 中间区域
+    return 'middle';
+  },
+
+  // 使用搜索专用相机聚焦到物体，根据所在墙调整角度
+  focusOnObjectWithSearchCamera: function(object, cabinet) {
+    // 如果没有传入档案柜，尝试从物体向上查找
+    const targetCabinet = cabinet || this.findParentCabinet(object);
+
+    // 获取物体位置
+    const targetPosition = new THREE.Vector3();
+    object.getWorldPosition(targetPosition);
+
+    // 确定物体所在的墙
+    const wallLocation = targetCabinet ? this.getWallLocation(targetCabinet) : 'middle';
+
+    // 根据墙的位置设置不同的相机偏移和角度
+    let cameraPosition, lookAtOffset;
+
+    // 档案柜和档案的不同偏移量
+    const isCabinet = object.cityName !== undefined;
+    const baseDistance = isCabinet ? 200 : 100;
+    const baseHeight = isCabinet ? 80 : 50;
+
+    switch(wallLocation) {
+      case 'left':
+        // 左墙：从右侧观察
+        cameraPosition = new THREE.Vector3(baseDistance, baseHeight, 0);
+        lookAtOffset = isCabinet ? 150 : 20;
+        break;
+      case 'right':
+        // 右墙：从左侧观察
+        cameraPosition = new THREE.Vector3(-baseDistance, baseHeight, 0);
+        lookAtOffset = isCabinet ? 150 : 20;
+        break;
+      case 'back':
+      default:
+        // 后墙或其他：从前方观察
+        cameraPosition = new THREE.Vector3(0, baseHeight, baseDistance);
+        lookAtOffset = isCabinet ? 150 : 20;
+        break;
+    }
+
+    // 计算相机目标位置
+    const cameraTarget = new THREE.Vector3().copy(targetPosition).add(cameraPosition);
+
+    // 平滑过渡到目标位置
+    new TWEEN.Tween(this.searchCamera.position)
+      .to(cameraTarget, 1000)
+      .easing(TWEEN.Easing.Quadratic.InOut)
+      .start();
+
+    // 确保相机看向物体，稍微向上看一点
+    const lookAtTarget = new THREE.Vector3().copy(targetPosition);
+    lookAtTarget.y += lookAtOffset;
+
+    new TWEEN.Tween(this.searchCamera.target)
+      .to(lookAtTarget, 1000)
+      .easing(TWEEN.Easing.Quadratic.InOut)
+      .onUpdate(() => {
+        this.searchCamera.lookAt(this.searchCamera.target);
+      })
+      .start();
+
+    // 切换到搜索相机
+    this.activeCamera = this.searchCamera;
+    this.camera = this.activeCamera;
+  },
+
+  // 查找物体所属的档案柜
+  findParentCabinet: function(object) {
+    let current = object;
+    while (current.parent) {
+      if (current.cityName) {
+        return current;
+      }
+      current = current.parent;
+    }
+    return null;
+  },
+
+  // 显示搜索通知
+  showSearchNotification: function(message) {
+    // 检查是否已有通知
+    let notification = document.getElementById('search-notification');
+    if (notification) {
+      notification.remove();
+    }
+
+    // 创建通知元素
+    notification = document.createElement('div');
+    notification.id = 'search-notification';
+    notification.textContent = message;
+    notification.style.cssText = `
+      position: absolute;
+      top: 80px;
+      left: 50%;
+      transform: translateX(-50%);
+      background-color: rgba(0, 0, 0, 0.7);
+      color: white;
+      padding: 10px 20px;
+      border-radius: 5px;
+      z-index: 40;
+      opacity: 0;
+      transition: opacity 0.3s;
+    `;
+
+    // 添加到容器
+    this.container.appendChild(notification);
+
+    // 显示通知
+    setTimeout(() => {
+      notification.style.opacity = '1';
+    }, 10);
+
+    // 3秒后隐藏通知
+    setTimeout(() => {
+      notification.style.opacity = '0';
+      setTimeout(() => {
+        if (notification.parentNode) {
+          notification.parentNode.removeChild(notification);
+        }
+      }, 300);
+    }, 3000);
+  },
+
+  // 创建鼠标锁定时的手掌指示器
+  createCursorIndicator: function() {
+    // 确保容器有相对定位
+    if (getComputedStyle(this.container).position === 'static') {
+      this.container.style.position = 'relative';
+    }
+
+    // 创建图标容器
+    this.cursorIndicator = document.createElement('div');
+    this.cursorIndicator.id = 'cursor-indicator';
+    this.cursorIndicator.style.cssText = `
+      position: absolute;
+      width: 50px;
+      height: 50px;
+      opacity: 0;
+      transition: opacity 0.3s ease;
+      pointer-events: none;
+      z-index: 10;
+    `;
+
+    // 手掌图标 - 带备用方案
+    this.cursorIndicator.innerHTML = `
+      <img src="/public/images/hand.png"
+           alt="手形光标"
+           style="width: 100%; height: 100%; object-fit: contain;"
+           onerror="this.src='data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj48cGF0aCBmaWxsPSIjZmZmZmZmIiBkPSJNMzgwLjYsMjQwYzAtMjYuNS0yMS41LTQ4LTQ4LTQ4cy00OCwyMS41LTQ4LDQ4czQ4LTIxLjUsNDgtNDh6TTI0MCwzMjBjMCwyNi41LTIxLjUtNDgtNDgtNDgtNDgtMjEuNS00OC00OCwyMS41LTQ4LDQ4LTR4czQ4LTIxLjUsNDgtNDh6TTIwMCwyODBjMCwyNi41LTIxLjUtNDgtNDgtNDgtNDgtMjEuNS00OC00OCwyMS41LTQ4LDQ4LTR4czQ4LTIxLjUsNDgtNDh6TTI4MCwyODBjMCwyNi41LTIxLjUtNDgtNDgtNDgtNDgtMjEuNS00OC00OCwyMS41LTQ4LDQ4LTR4czQ4LTIxLjUsNDgtNDh6Ii8+PHBhdGggZmlsbD0iI2ZmZmZmZiIgZD0iTTIwMCwxMjBjMC0yNi41LTIxLjUtNDgtNDgtNDhTMTEyLDY1LjUsMTEyLDkyYzAsMjYuNSwyMS41LDQ4LDQ4LDQ4czQ4LTIxLjUsNDgtNDh6TTM2MCwxMjBjMC0yNi41LTIxLjUtNDgtNDgtNDhTMzEyLDY1LjUsMzEyLDkyYzAsMjYuNSwyMS41LDQ4LDQ4LDQ4czQ4LTIxLjUsNDgtNDh6Ii8+PC9zdmc+'">
+    `;
+
+    // 添加到canvas容器中
+    this.container.appendChild(this.cursorIndicator);
+
+    // 添加尺寸变化监听
+    this.addCursorResizeListener();
+  },
+
+  // 使光标指示器居中
+  centerCursorIndicator: function() {
+    if (!this.cursorIndicator || !this.container) return;
+    this.cursorIndicator.style.left = '50%';
+    this.cursorIndicator.style.top = '50%';
+    this.cursorIndicator.style.transform = 'translate(-50%, -50%)';
+  },
+
+  // 添加尺寸变化监听器
+  addCursorResizeListener: function() {
+    // 防抖函数
+    const debounce = (func, wait) => {
+      let timeout;
+      return function(...args) {
+        clearTimeout(timeout);
+        timeout = setTimeout(() => func.apply(this, args), wait);
+      };
+    };
+
+    // 定义处理函数
+    this.handleCursorResize = debounce(() => {
+      this.centerCursorIndicator();
+    }, 50);
+
+    // 监听窗口大小变化
+    window.addEventListener('resize', this.handleCursorResize);
+  },
+
+  // 添加坐标辅助器
+  addAxesHelper: function() {
+    const axesHelper = new THREE.AxesHelper(100);
+    // this.scene.add(axesHelper);
+  },
+
+  // 绘制墙壁
+  drawWalls: function() {
+    // 墙壁厚度
+    const wallThickness = 10;
+
+    // 后墙 (z 负方向)
+    const backWall = new THREE.Mesh(
+      new THREE.BoxGeometry(ROOM_SIZE, 250, wallThickness),
+      new THREE.MeshPhongMaterial({ color: this.Colors.wall })
+    );
+    backWall.position.set(0, 125 + SCENE_Y_OFFSET, -ROOM_SIZE/2);
+    backWall.receiveShadow = true;
+    this.group.add(backWall);
+
+    // 左墙 (x 负方向)
+    const leftWall = new THREE.Mesh(
+      new THREE.BoxGeometry(wallThickness, 250, ROOM_SIZE - DOOR_WIDTH + 220),
+      new THREE.MeshPhongMaterial({ color: this.Colors.wall })
+    );
+    leftWall.position.set(-ROOM_SIZE/2, 125 + SCENE_Y_OFFSET, -(ROOM_SIZE - DOOR_WIDTH)/2 + 200);
+    leftWall.receiveShadow = true;
+    this.group.add(leftWall);
+
+    // 右墙 (x 正方向)
+    const rightWall = new THREE.Mesh(
+      new THREE.BoxGeometry(wallThickness, 250, ROOM_SIZE - DOOR_WIDTH + 200),
+      new THREE.MeshPhongMaterial({ color: this.Colors.wall })
+    );
+    rightWall.position.set(ROOM_SIZE/2, 125 + SCENE_Y_OFFSET, -(ROOM_SIZE - DOOR_WIDTH)/2 + 200);
+    rightWall.receiveShadow = true;
+    this.group.add(rightWall);
+  },
+
+  draw: function () {
+    const _this = this;
+
+    // 档案柜尺寸
+    const cabinetWidth = 100;
+    const cabinetDepth = 36;
+
+    // 计算每面墙可放置的档案柜数量
+    const cabinetsPerBackWall = Math.floor(ROOM_SIZE / (cabinetWidth + CABINET_SPACING));
+    const cabinetsPerSideWall = Math.floor((ROOM_SIZE - DOOR_WIDTH) / (cabinetWidth + CABINET_SPACING));
+
+    // 分配档案柜到三面墙
+    let cabinetIndex = 0;
+    const positions = [];
+
+    // 1. 后墙档案柜 (z 负方向，面向前方)
+    const backWallStartX = -ROOM_SIZE/2 + cabinetWidth/2;
+    for (let i = 0; i < cabinetsPerBackWall && cabinetIndex < liaoningCities.length; i++) {
+      positions.push({
+        x: backWallStartX + i * (cabinetWidth + CABINET_SPACING) + 45,
+        z: -ROOM_SIZE/2 + cabinetDepth/2 + 5,
+        rotation: 0,
+        wall: 'back' // 记录所在墙
+      });
+      cabinetIndex++;
+    }
+
+    // 2. 左墙档案柜 (x 负方向，面向右方)
+    const leftWallStartZ = -ROOM_SIZE/2 + cabinetWidth/2 + DOOR_WIDTH/2;
+    for (let i = 0; i < cabinetsPerSideWall && cabinetIndex < liaoningCities.length; i++) {
+      positions.push({
+        x: -ROOM_SIZE/2 + cabinetDepth/2 + 5,
+        z: leftWallStartZ + i * (cabinetWidth + CABINET_SPACING),
+        rotation: Math.PI/2,
+        wall: 'left' // 记录所在墙
+      });
+      cabinetIndex++;
+    }
+
+    // 3. 右墙档案柜 (x 正方向，面向左方)
+    const rightWallStartZ = -ROOM_SIZE/2 + cabinetWidth/2 + DOOR_WIDTH/2;
+    for (let i = 0; i < cabinetsPerSideWall && cabinetIndex < liaoningCities.length; i++) {
+      positions.push({
+        x: ROOM_SIZE/2 - cabinetDepth/2 - 5,
+        z: rightWallStartZ + i * (cabinetWidth + CABINET_SPACING),
+        rotation: -Math.PI/2,
+        wall: 'right' // 记录所在墙
+      });
+      cabinetIndex++;
+    }
+
+    // 为每个市创建一个档案柜
+    liaoningCities.forEach((city, index) => {
+      if (index >= positions.length) return;
+
+      const pos = positions[index];
+
+      // 创建档案柜
+      const cabinet = this.createCabinet(cabinetWidth, 180, cabinetDepth, {
+        x: pos.x,
+        y: 0 + SCENE_Y_OFFSET,
+        z: pos.z
+      });
+      cabinet.rotation.y = pos.rotation;
+      cabinet.cityName = city.name;
+      cabinet.wallLocation = pos.wall; // 存储所在墙信息
+      this.cabinets.push(cabinet);
+      this.group.add(cabinet)
+
+      // 创建档案柜标签(显示市名)
+      let labelX = pos.x;
+      let labelZ = pos.z;
+
+      if (pos.rotation === 0) {
+        labelZ += 50;
+      } else if (pos.rotation === Math.PI/2) {
+        labelX += 50;
+      } else {
+        labelX -= 50;
+      }
+
+      const cabinetLabel = this.createLabel(city.name, 30, {
+        x: labelX,
+        y: 180 + 15 + SCENE_Y_OFFSET,
+        z: labelZ
+      });
+      this.labels.push(cabinetLabel);
+      this.scene.add(cabinetLabel);
+
+      // 计算需要多少层来放置区档案
+      const floors = Math.ceil(city.districts.length / 6);
+
+      // 为每个区创建一个档案(书)
+      city.districts.forEach((district, distIndex) => {
+        const floorIndex = Math.floor(distIndex / 6) + 1;
+        const positionInRow = distIndex % 6;
+
+        if (positionInRow === 0) {
+          const archiveRow = this.createArchiveRow(
+            36, 40, 8, 6,
+            city.districts.slice(distIndex, distIndex + 6)
+          );
+
+          this.putArchiveRow(archiveRow, cabinet, floorIndex);
+          cabinet.add(archiveRow);
+        }
+      });
+    });
+
+    // 添加地面
+    const groundGeometry = new THREE.PlaneGeometry(ROOM_SIZE + 100, ROOM_SIZE + 100);
+    const groundMaterial = new THREE.MeshPhongMaterial({
+      color: "#c8edf5",
+      shininess: 5,
+      side: THREE.DoubleSide// 双面可见
+
+    });
+    const ground = new THREE.Mesh(groundGeometry, groundMaterial);
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y =  SCENE_Y_OFFSET;
+    ground.receiveShadow = true;
+    this.group.add(ground);
+
+    // 档案点击事件
+    this.container.addEventListener("mousedown", (event) => {
+      _this.handleAllRaycasters(event, (e, intersects) => {
+        const intersectsObj = intersects[0].object;
+
+        // for (let i = 0; i < _this.archives.length; i++) {
+        //   _this.returnBook(_this.archives[i]);
+        // }
+        if (intersectsObj.name === "book") {
+          _this.showBook(intersectsObj.parent);
+        }
+      }, (e, intersects) => {
+        for (let i = 0; i < _this.archives.length; i++) {
+          // _this.returnBook(_this.archives[i]);
+        }
+      });
+    }, false);
+  },
+
+  // 创建一排档案
+  createArchiveRow: function (width, height, depth, num, districts) {
+    const _this = this;
+    const archiveRow = new THREE.Object3D();
+    archiveRow.archiveWidth = width;
+    archiveRow.archiveHeight = height;
+    archiveRow.archiveDepth = depth;
+    archiveRow.archiveNum = num;
+
+    for (let i = 0; i < num; i++) {
+      if (!districts[i]) break;
+
+      (function (j) {
+        const district = districts[j];
+        const archive = _this.createArchive(width, height, depth, {
+          x: (depth + 1) * j - (depth + 1) * (num - 1) / 2,
+          y: 0,
+          z: 0
+        }, district);
+        archive.districtInfo = district; // 存储完整的区域信息
+        archive.name = 'book';
+        _this.archives.push(archive);
+        archiveRow.add(archive);
+      })(i);
+    }
+
+    return archiveRow;
+  },
+
+  // 将档案排放到档案柜上
+  putArchiveRow: function (archiveRow, cabinet, floorIndex) {
+    const thickness = cabinet.thickness;
+    const floorY = cabinet.floorsY[floorIndex || 1];
+
+    const innerWidth = cabinet.cabinetWidth - 2 * cabinet.thickness;
+    const rowTotalWidth = archiveRow.archiveNum * (archiveRow.archiveDepth + 1) - 1;
+    const xOffset = (innerWidth - rowTotalWidth) / 2 - innerWidth / 2;
+
+    archiveRow.position.set(
+      xOffset + 8,
+      floorY + thickness / 2,
+      -cabinet.cabinetDepth / 2 + 20
+    );
+  },
+
+  // 创建档案柜
+  createCabinet: function (width, height, depth, position = {x: 0, y: 0, z: 0}, floorNum = 4) {
+    const cabinet = new THREE.Object3D();
+    cabinet.cabinetWidth = width;
+    cabinet.cabinetHeight = height;
+    cabinet.cabinetDepth = depth;
+    cabinet.floorsY = [];
+    cabinet.thickness = 4;
+
+    // 档案柜几何体
+    const cabinetHorizontal = new THREE.BoxGeometry(width, cabinet.thickness, depth, 3, 3, 3);
+    const cabinetVertical = new THREE.BoxGeometry(cabinet.thickness, height, depth, 3, 3, 3);
+    const cabinetBack = new THREE.BoxGeometry(width, height, cabinet.thickness, 3, 3, 3);
+
+    // 档案柜材质
+    const cabinetMat = new THREE.MeshPhongMaterial({
+      color: this.Colors.brown,
+      shininess: 10,
+      map: new THREE.TextureLoader().load('/public/images/wood.jpg'),
+    });
+
+    // 左侧板
+    const leftSide = new THREE.Mesh(cabinetVertical, cabinetMat);
+    leftSide.castShadow = true;
+    leftSide.receiveShadow = true;
+    leftSide.position.x = -width / 2 + cabinet.thickness / 2;
+    leftSide.position.y = height / 2;
+    leftSide.name = "cabinet_side";
+
+    // 右侧板
+    const rightSide = new THREE.Mesh(cabinetVertical, cabinetMat);
+    rightSide.castShadow = true;
+    rightSide.receiveShadow = true;
+    rightSide.receiveShadow = true;
+    rightSide.position.x = width / 2 - cabinet.thickness / 2;
+    rightSide.position.y = height / 2;
+    rightSide.name = "cabinet_side";
+
+    // 背板
+    const backPanel = new THREE.Mesh(cabinetBack, cabinetMat);
+    backPanel.castShadow = true;
+    backPanel.receiveShadow = true;
+    backPanel.position.z = -depth / 2 + cabinet.thickness / 2;
+    backPanel.position.y = height / 2;
+    backPanel.name = "cabinet_back";
+
+    cabinet.add(leftSide);
+    cabinet.add(rightSide);
+    cabinet.add(backPanel);
+
+    // 添加层板
+    const floorGap = height / floorNum;
+    for (let i = 0; i < floorNum + 1; i++) {
+      ((j) => {
+        const floor = new THREE.Mesh(cabinetHorizontal, cabinetMat);
+        floor.position.y = height / 2 - floorGap * j + 90;
+        floor.position.z = 0;
+        floor.castShadow = true;
+        floor.receiveShadow = true;
+        floor.name = "cabinet_floor";
+        cabinet.add(floor);
+        cabinet.floorsY.push(floor.position.y);
+      })(i)
+    }
+
+    cabinet.position.set(position.x, position.y, position.z);
+
+    return cabinet;
+  },
+
+  // 创建档案(书)
+  createArchive: function (width, height, depth, position, district) {
+    const _this = this;
+    // 侧面材质 - 带区名标签
+    const districtTexture = new THREE.CanvasTexture(this.generateDistrictLabel(district));
+    const districtMaterial = new THREE.MeshPhongMaterial({
+      map: districtTexture,
+      side: THREE.FrontSide
+    });
+
+    // 正面材质 - 带区名和所属城市
+    const frontTexture = new THREE.CanvasTexture(this.generateFrontLabel(district));
+    const frontMaterial = new THREE.MeshPhongMaterial({
+      map: frontTexture,
+      side: THREE.FrontSide
+    });
+
+    // 其他面材质
+    const sideMaterial = new THREE.MeshPhongMaterial({
+      color: this.Colors.gray,
+      shininess: 5
+    });
+
+    const backMaterial = new THREE.MeshPhongMaterial({
+      color: this.Colors.gray,
+      shininess: 5
+    });
+
+    // 材质分配
+    const materials = [
+      sideMaterial,      // 右
+      districtMaterial,  // 左
+      sideMaterial,      // 上
+      sideMaterial,      // 下
+      frontMaterial,     // 前
+      backMaterial       // 后
+    ];
+
+    const archiveBox = new THREE.Object3D();
+    archiveBox.name = "book";
+    const archive = new THREE.BoxGeometry(width, height, depth, 3, 3, 3);
+
+    const m_archive = new THREE.Mesh(archive, materials);
+    m_archive.position.set(0, height / 2, 0);
+    m_archive.rotation.y = Math.PI / 2;
+    m_archive.castShadow = true;
+    m_archive.receiveShadow = true;
+    m_archive.name = "book";
+
+    archiveBox.add(m_archive);
+    archiveBox.position.set(position.x, position.y, position.z);
+    archiveBox._position = {...position};
+
+    // 添加悬停效果
+    archiveBox.on("hover",
+      (event, target) => {
+        if (!target.isShow) {
+          new TWEEN.Tween(m_archive.scale)
+            .to({x: 1.05, y: 1.05, z: 1.05}, 200)
+            .easing(TWEEN.Easing.Quadratic.InOut)
+            .start();
+          _this.renderer.domElement.style.cursor = "pointer";
+        }
+      },
+      (event, target) => {
+        if (!target.isShow) {
+          new TWEEN.Tween(m_archive.scale)
+            .to({x: 1, y: 1, z: 1}, 200)
+            .easing(TWEEN.Easing.Quadratic.InOut)
+            .start();
+          _this.renderer.domElement.style.cursor = "default";
+        }
+      }
+    );
+
+    return archiveBox;
+  },
+
+  // 生成书籍正面标签（显示所属城市）
+  generateFrontLabel: function (district) {
+    const canvas = document.createElement('canvas');
+    const context = canvas.getContext('2d');
+    canvas.width = 256;
+    canvas.height = 128;
+
+    // 标签背景
+    context.fillStyle = '#837261';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+
+    // 边框
+    context.strokeStyle = '#837261';
+    context.lineWidth = 2;
+    context.strokeRect(5, 5, canvas.width - 10, canvas.height - 10);
+
+    // 标签文字 - 区名
+    context.fillStyle = '#ffffff';
+    context.font = 'bold 28px SimHei, sans-serif';
+    context.textAlign = 'center';
+    context.textBaseline = 'middle';
+    context.fillText(`${district.name}水利工程`, canvas.width / 2, canvas.height / 2 - 15);
+
+    // 显示所属城市
+    context.font = '16px SimHei, sans-serif';
+    context.fillStyle = '#f0f0f0';
+    context.fillText(`(${district.parentCity})`, canvas.width / 2, canvas.height / 2 + 20);
+
+    return canvas;
+  },
+
+  // 生成区名标签
+  generateDistrictLabel: function (district) {
+    const canvas = document.createElement('canvas');
+    const context = canvas.getContext('2d');
+    canvas.width = 128;
+    canvas.height = 256;
+
+    // 标签背景
+    context.fillStyle = '#3f3425';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+
+    // 标签文字 - 区名
+    context.fillStyle = '#ffc400';
+    context.font = 'bold 32px SimHei, sans-serif';
+    context.textAlign = 'center';
+    context.textBaseline = 'middle';
+
+    // 处理长名称换行
+    const maxCharsPerLine = 1;
+    let lines = [];
+    for (let i = 0; i < district.name.length; i += maxCharsPerLine) {
+      lines.push(district.name.substring(i, i + maxCharsPerLine));
+    }
+
+    // 绘制文字
+    lines.forEach((line, index) => {
+      const yPos = canvas.height / 2 + (index - (lines.length - 1) / 2) * 40;
+      context.fillText(line, canvas.width / 2, yPos);
+    });
+
+    // 底部显示城市缩写
+    context.font = '14px SimHei, sans-serif';
+    context.fillStyle = '#cccccc';
+    context.fillText(
+      district.parentCity.substring(0, 2),
+      canvas.width / 2,
+      canvas.height - 20
+    );
+
+    return canvas;
+  },
+
+  // 创建标签(显示市名)
+  createLabel: function (text, size, position) {
+    // 创建Canvas绘制文字
+    const canvas = document.createElement('canvas');
+    const context = canvas.getContext('2d');
+    const font = `${size}px SimHei, sans-serif`;
+
+    // 测量文字宽度
+    context.font = font;
+    const textWidth = context.measureText(text).width;
+
+    // 设置Canvas尺寸
+    canvas.width = textWidth + 40;
+    canvas.height = size + 20;
+
+    // 确保背景完全透明
+    context.clearRect(0, 0, canvas.width, canvas.height);
+
+    // 绘制文字
+    context.font = font;
+    context.fillStyle = this.Colors.gold;
+    context.textAlign = 'center';
+    context.textBaseline = 'middle';
+    context.fillText(text, canvas.width / 2, canvas.height / 2);
+
+    // 创建平面显示文字
+    const texture = new THREE.CanvasTexture(canvas);
+    const material = new THREE.MeshBasicMaterial({
+      map: texture,
+      transparent: true,
+      side: THREE.DoubleSide
+    });
+    const geometry = new THREE.PlaneGeometry(canvas.width / 2, canvas.height / 2);
+    const label = new THREE.Mesh(geometry, material);
+
+    // 创建标签组，始终面向相机
+    const labelGroup = new THREE.Object3D();
+    labelGroup.add(label);
+    labelGroup.position.set(position.x, position.y, position.z);
+
+    // 每帧更新标签朝向
+    labelGroup.update = function() {
+      this.lookAt(this.camera.position);
+    }.bind(labelGroup);
+
+    // 存储相机引用
+    labelGroup.camera = this.camera;
+
+    return labelGroup;
+  },
+
+  showBook: function (book_box) {
+    const _this = this;
+    if (!(book_box.isShow || this.bookLocked)) {
+      this.bookLocked = true;
+      const m_book = book_box.children[0];
+      const width = m_book.geometry.parameters.width;
+      const height = m_book.geometry.parameters.height;
+      const depth = m_book.geometry.parameters.depth;
+      const deg = 150 / 180 * Math.PI;
+
+      const tween = new TWEEN.Tween(book_box.position).to({ z: 20 }, 500);
+      const tween1 = new TWEEN.Tween(book_box.rotation).to({ x: deg }, 500);
+      const tween2 = new TWEEN.Tween(book_box.position).to({
+        x: 0,
+        y: -1 * height / 2,
+      }, 500).easing(TWEEN.Easing.Cubic.Out);
+      const tween3 = new TWEEN.Tween(m_book.rotation).to({ y: 0 }, 500).easing(TWEEN.Easing.Cubic.InOut);
+      const tween4 = new TWEEN.Tween(book_box.rotation).to({ x: 0 }, 500).easing(TWEEN.Easing.Cubic.InOut);
+      const tween5 = new TWEEN.Tween(book_box.position).to({
+        y: 0,
+        z: width * 1.2
+      }, 500).easing(TWEEN.Easing.Cubic.Out);
+      const tween6 = new TWEEN.Tween(m_book.scale).to({
+        x: 1.2,
+        y: 1.2,
+        z: 1.2
+      }, 500).easing(TWEEN.Easing.Cubic.InOut);
+      const tween7 = new TWEEN.Tween(book_box.position).to({
+        y: height * 0.1
+      }, 500).easing(TWEEN.Easing.Cubic.InOut);
+
+      tween.chain(tween1).start();
+      setTimeout(() => tween1.chain(tween2).start(), 300);
+      setTimeout(() => tween3.chain(tween4).start(), 300);
+      setTimeout(() => tween5.chain(tween6).start(), 1000);
+      setTimeout(() => {
+        tween7.onComplete(() => {
+          book_box.isShow = true;
+          _this.bookLocked = false;
+        }).start();
+      }, 1500);
+
+      // 展示档案数据，包含完整的区域信息
+      setTimeout(() => {  // 箭头函数保留 this 指向组件实例
+
+        // console.log(this)
+        // this.$router.push({
+        //   name: "fileDetails",
+        //   params: {cityName: book_box.districtInfo.path}
+        // });
+        // this.onJump(book_box.districtInfo.path);
+        console.log(book_box.districtInfo.path)
+        this.ifTurn = false;
+        this.handleShowTable(book_box.districtInfo.path)
+      }, 3000);
+    }
+  },
+
+  returnBook: function (book_box) {
+    const _this = this;
+    if (book_box.isShow && (!this.bookLocked)) {
+      this.bookLocked = true;
+      const m_book = book_box.children[0];
+      const width = m_book.geometry.parameters.width;
+      const height = m_book.geometry.parameters.height;
+
+      const tween1 = new TWEEN.Tween(m_book.scale).to({ x: 1, y: 1, z: 1 }, 300).easing(TWEEN.Easing.Cubic.InOut);
+      const tween2 = new TWEEN.Tween(book_box.position).to({
+        x: book_box._position.x,
+        y: 0
+      }, 300).easing(TWEEN.Easing.Cubic.InOut);
+      const tween3 = new TWEEN.Tween(m_book.rotation).to({ y: Math.PI / 2 }, 500).easing(TWEEN.Easing.Cubic.InOut);
+      const tween4 = new TWEEN.Tween(book_box.position).to({ z: 0 }, 300).easing(TWEEN.Easing.Cubic.InOut);
+
+      tween1.start();
+      tween2.chain(tween3).start();
+      setTimeout(() => {
+        tween4.onComplete(() => {
+          book_box.isShow = false;
+          _this.bookLocked = false;
+          if (_this.Event.onBookReturned) _this.Event.onBookReturned(book_box);
+        }).start();
+      }, 800);
+    }
+  },
+
+  // 添加机器人模型
+  addRobot: function(){
+    // 创建一个人的碰撞体
+    this.playerCollider = new Capsule(
+      new THREE.Vector3(0, 0.35, 0),
+      new THREE.Vector3(0, 1.85, 0),
+      0.35,
+    )
+
+    // 加载机器人模型
+    const gltfLoader = new GLTFLoader();
+    this.mixer = null;
+    this.actions = {};
+    this.activeAction = null;
+
+    this.capsule = new THREE.Object3D();
+    this.capsule.position.set(0, SCENE_Y_OFFSET + 0.85, 0);
+    this.capsule.receiveShadow = true;
+
+    // 加载机器人模型
+    const _this = this;
+    gltfLoader.load('/public/model/RobotExpressive.glb', (gltf) => {
+      const robot = gltf.scene;
+      robot.scale.set(20, 20, 20);
+      robot.rotation.set(0, Math.PI, 0);
+      robot.receiveShadow = true;
+      robot.castShadow = true;
+
+      _this.capsule.add(robot);
+
+      // 初始化动画混合器
+      _this.mixer = new THREE.AnimationMixer(robot);
+
+      // 处理动画
+      gltf.animations.forEach(anim => {
+        let name = anim.name;
+        _this.actions[name] = _this.mixer.clipAction(anim);
+
+        if (name === "Idle" || name === "Walking" || name === "Running") {
+          _this.actions[name].clampWhenFinished = false;
+          _this.actions[name].loop = THREE.LoopRepeat;
+        } else {
+          _this.actions[name].clampWhenFinished = true;
+          _this.actions[name].loop = THREE.LoopOnce;
+        }
+      });
+
+      // 默认播放Idle动画
+      _this.activeAction = _this.actions["Idle"];
+      _this.activeAction.play();
+    }, undefined, (error) => {
+      console.error('模型加载错误:', error);
+    });
+
+    // 机器人相机设置
+    this.robatCamera = new THREE.PerspectiveCamera(
+      60,
+      this.WIDTH / this.HEIGHT,
+      1,
+      3000
+    );
+    this.robatCamera.position.set(0, SCENE_Y_OFFSET + 60, -70);
+
+    // 相机控制容器
+    this.capsuleBodyControl = new THREE.Object3D();
+    this.capsuleBodyControl.add(this.cameraDefault);
+    this.capsuleBodyControl.add(this.robatCamera);
+    this.capsule.add(this.capsuleBodyControl);
+
+    this.scene.add(this.capsule);
+  },
+
+  // 创建场景
+  createScene: function () {
+    const _this = this;
+    // 获取容器的实际宽高
+    this.HEIGHT = this.container.offsetHeight;
+    this.WIDTH = this.container.offsetWidth;
+
+    // 创建场景
+    this.scene = new THREE.Scene();
+    this.scene.background = new THREE.Color(0xf0f8ff);
+
+    // 计算宽高比
+    const aspectRatio = this.WIDTH / this.HEIGHT;
+
+    // 创建默认相机（上帝视角）
+    this.cameraDefault = new THREE.PerspectiveCamera(
+      60,
+      aspectRatio,
+      1,
+      3000
+    );
+    this.cameraDefault.position.set(0, 100 + SCENE_Y_OFFSET, 300);
+
+    // 创建搜索专用相机
+    this.searchCamera = new THREE.PerspectiveCamera(
+      65, // 稍微广角一点，便于查看细节
+      aspectRatio,
+      1,
+      3000
+    );
+    this.searchCamera.position.set(0, 100 + SCENE_Y_OFFSET, 300);
+    this.searchCamera.target = new THREE.Vector3(); // 用于存储目标位置
+
+    // 设置当前相机
+    this.camera = this.cameraDefault;
+
+    // 创建渲染器
+    this.renderer = new THREE.WebGLRenderer({
+      alpha: true,
+      antialias: true
+    });
+    this.renderer.setSize(this.WIDTH, this.HEIGHT);
+    this.renderer.domElement.style.width = '100%';
+    this.renderer.domElement.style.height = '100%';
+
+    // 打开阴影地图
+    this.renderer.shadowMap.enabled = true;
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+    // 添加到容器
+    this.container.appendChild(this.renderer.domElement);
+
+    // 监听窗口大小变化
+    window.addEventListener('resize', this.handleWindowResize.bind(this), false);
+
+    // 为3D物体添加鼠标事件
+    THREE.Object3D.prototype.on = function (eventName, touchCallback, notTouchCallback) {
+      switch (eventName) {
+        case "hover":
+          _this.container.addEventListener("mousemove", (event) => {
+            _this.handleRaycaster(event, this, (_event, _target) => {
+              this.enter = true;
+              if (this.enter != this.lastEnter && this.enter == true) {
+                touchCallback && touchCallback(_event, _target);
+                this.lastEnter = true;
+              }
+            }, (_event, _target) => {
+              this.enter = false;
+              if (this.enter != this.lastEnter && this.enter == false) {
+                notTouchCallback && notTouchCallback(_event, _target);
+                this.lastEnter = false;
+              }
+            });
+          }, false);
+          break;
+        default:
+          _this.container.addEventListener(eventName, (event) => {
+            _this.handleRaycaster(event, this, touchCallback, notTouchCallback);
+          }, false);
+      }
+    }
+  },
+
+  // 射线检测
+  handleRaycaster: function (event, target, touchCallback, notTouchCallback) {
+    if (this.isSearchFocused) return;
+
+    const mouse = new THREE.Vector2();
+    const raycaster = new THREE.Raycaster();
+    const canvas = this.renderer.domElement;
+
+    if (this.isLock) {
+      mouse.x = 0;
+      mouse.y = 0;
+    } else {
+      const rect = canvas.getBoundingClientRect();
+      const mouseX = event.clientX - rect.left;
+      const mouseY = event.clientY - rect.top;
+      mouse.x = (mouseX / rect.width) * 2 - 1;
+      mouse.y = -(mouseY / rect.height) * 2 + 1;
+    }
+
+    raycaster.setFromCamera(mouse, this.camera);
+    const intersects = raycaster.intersectObject(target);
+
+    if (intersects.length > 0) {
+      touchCallback && touchCallback(event, target);
+    } else {
+      notTouchCallback && notTouchCallback(event, target);
+    }
+  },
+
+  // 批量射线检测
+  handleAllRaycasters: function (event, touchCallback, notTouchCallback) {
+    if (this.isSearchFocused) return;
+
+    const mouse = new THREE.Vector2();
+    const raycaster = new THREE.Raycaster();
+    const canvas = this.renderer.domElement;
+
+    if (this.isLock) {
+      mouse.x = 0;
+      mouse.y = 0;
+    } else {
+      const rect = canvas.getBoundingClientRect();
+      const mouseX = event.clientX - rect.left;
+      const mouseY = event.clientY - rect.top;
+      mouse.x = (mouseX / rect.width) * 2 - 1;
+      mouse.y = -(mouseY / rect.height) * 2 + 1;
+    }
+
+    raycaster.setFromCamera(mouse, this.camera);
+    const intersects = raycaster.intersectObjects(this.scene.children, true);
+
+    if (intersects.length > 0) {
+      touchCallback && touchCallback(event, intersects);
+    } else {
+      notTouchCallback && notTouchCallback(event, intersects);
+    }
+  },
+
+  // 窗口大小调整
+  handleWindowResize: function () {
+    this.HEIGHT = this.container.offsetHeight;
+    this.WIDTH = this.container.offsetWidth;
+
+    this.renderer.setSize(this.WIDTH, this.HEIGHT);
+
+    const aspectRatio = this.WIDTH / this.HEIGHT;
+
+    if (this.cameraDefault) {
+      this.cameraDefault.aspect = aspectRatio;
+      this.cameraDefault.updateProjectionMatrix();
+    }
+
+    if (this.robatCamera) {
+      this.robatCamera.aspect = aspectRatio;
+      this.robatCamera.updateProjectionMatrix();
+    }
+
+    // 更新搜索相机的宽高比
+    if (this.searchCamera) {
+      this.searchCamera.aspect = aspectRatio;
+      this.searchCamera.updateProjectionMatrix();
+    }
+  },
+
+  // 创建光源
+  createLights: function () {
+    // 半球光
+    this.hemisphereLight = new THREE.HemisphereLight(0xffffff, 0x444444, 1.8);
+
+    // 环境光
+    this.ambientLight = new THREE.AmbientLight(0xffffff, 0.3);
+
+    // 方向光(主光源)
+    this.shadowLight = new THREE.DirectionalLight(0xffffff, 1.9);
+    this.shadowLight.castShadow = true;
+
+    // 阴影设置
+    this.shadowLight.shadow.camera.left = -1000;
+    this.shadowLight.shadow.camera.right = 1000;
+    this.shadowLight.shadow.camera.top = 1000;
+    this.shadowLight.shadow.camera.bottom = -1000;
+    this.shadowLight.shadow.camera.near = 1;
+    this.shadowLight.shadow.camera.far = 3000;
+
+    // 阴影分辨率
+    this.shadowLight.shadow.mapSize.width = 2048;
+    this.shadowLight.shadow.mapSize.height = 2048;
+    this.shadowLight.position.set(controls.posX, controls.posY + SCENE_Y_OFFSET, controls.posZ);
+
+    // 添加光源到场景
+    this.scene.add(this.hemisphereLight);
+    this.scene.add(this.shadowLight);
+    this.scene.add(this.ambientLight);
+  },
+
+  // 更新机器人状态
+  updatePlayer: function(deltaTime){
+    if (this.isSearchFocused) return;
+
+    const damping = -0.6;
+
+    // 应用重力
+    if (this.playerOnFloor) {
+      this.playerVelocity.y = 0;
+      if (!this.keyStates.isDown) {
+        this.playerVelocity.addScaledVector(this.playerVelocity, damping);
+      }
+    } else {
+      this.playerVelocity.y += this.gravity * deltaTime;
+    }
+
+    // 计算玩家移动距离
+    const playerMoveDistance = this.playerVelocity.clone().multiplyScalar(deltaTime);
+    this.playerCollider.translate(playerMoveDistance);
+
+    // 设置胶囊物体位置
+    this.playerCollider.getCenter(this.capsule.position);
+
+    // 检测碰撞
+    this.playerCollisions();
+
+    // 判断走路状态
+    const speed = Math.abs(this.playerVelocity.x) + Math.abs(this.playerVelocity.z);
+    if (speed > 0.1 && speed <= 3) {
+      this.fadeToAction("Walking");
+    } else if (speed > 3) {
+      this.fadeToAction("Running");
+    } else {
+      this.fadeToAction("Idle");
+    }
+  },
+
+  // 碰撞检测
+  playerCollisions:function (){
+    const result = this.worldOctree.capsuleIntersect(this.playerCollider);
+    this.playerOnFloor = false;
+    if (result) {
+      this.playerOnFloor = result.normal.y > 0;
+      this.playerCollider.translate(result.normal.multiplyScalar(result.depth));
+    }
+  },
+
+  // 重置玩家位置
+  resetPlayer: function(){
+    if (this.capsule.position.y < -20 + SCENE_Y_OFFSET) {
+      this.playerCollider.start.set(0, 2.35, 0);
+      this.playerCollider.end.set(0, 3.35, 0);
+      this.playerCollider.radius = 0.35;
+      this.playerVelocity.set(0, 0, 0);
+      this.playerDirection.set(0, 0, 0);
+      this.capsule.position.set(0, 0.85 + SCENE_Y_OFFSET, 200);
+    }
+  },
+
+  // 切换动画
+  fadeToAction: function(actionName){
+    if (!this.actions || !this.actions[actionName]) return;
+
+    let preAction = this.activeAction;
+
+    if (actionName !== "Wave" && actionName !== "Jump") {
+      this.actionIF = false;
+    }
+
+    if (preAction !== null && preAction !== this.actions[actionName]) {
+      if (this.mixer) {
+        this.mixer.removeEventListener("finished", this.onAnimationFinished);
+      }
+
+      const _this = this;
+      this.onAnimationFinished = function() {
+        _this.actionIF = false;
+        const currentAction = _this.activeAction;
+        _this.activeAction = _this.actions["Idle"];
+
+        currentAction.fadeOut(0.3);
+        _this.activeAction
+          .reset()
+          .setEffectiveTimeScale(1)
+          .setEffectiveWeight(1)
+          .fadeIn(0.3)
+          .play();
+      };
+
+      preAction.fadeOut(0.3);
+      this.activeAction = this.actions[actionName];
+      this.activeAction.reset()
+        .setEffectiveTimeScale(1)
+        .setEffectiveWeight(1)
+        .fadeIn(0.3)
+        .play();
+
+      if (actionName === "Wave" || actionName === "Jump") {
+        this.mixer.addEventListener("finished", this.onAnimationFinished);
+      }
+    }
+  },
+
+  // 添加事件监听
+  addEvent: function(){
+    const _this = this;
+
+    // 指针锁定变更事件
+    document.addEventListener('pointerlockchange', lockChangeHandler, false);
+    document.addEventListener('mozpointerlockchange', lockChangeHandler, false);
+    document.addEventListener('webkitpointerlockchange', lockChangeHandler, false);
+
+    function lockChangeHandler() {
+      if (document.pointerLockElement === _this.container ||
+        document.mozPointerLockElement === _this.container ||
+        document.webkitPointerLockElement === _this.container) {
+        _this.isLock = true;
+        if (_this.cursorIndicator) _this.cursorIndicator.style.opacity = '1';
+      } else {
+        _this.isLock = false;
+        if (_this.cursorIndicator) _this.cursorIndicator.style.opacity = '0';
+      }
+    }
+
+    // 键盘按下事件
+    document.addEventListener("keydown", (event) => {
+      if (this.isSearchFocused) {
+        // 只允许回车键（用于提交搜索）
+        if (event.code !== 'Enter') return;
+      }
+
+      if(event.code === 'KeyQ'){
+        if (_this.container && document.contains(_this.container)) {
+          const requestPointerLock = _this.container.requestPointerLock ||
+            _this.container.mozRequestPointerLock ||
+            _this.container.webkitRequestPointerLock;
+
+          if (requestPointerLock) {
+            try {
+              requestPointerLock.call(_this.container);
+            } catch (e) {
+              console.error('鼠标锁定失败:', e);
+              _this.isLock = false;
+            }
+          }
+        } else {
+          console.warn('容器元素不存在，无法锁定鼠标');
+          _this.isLock = false;
+        }
+      } else {
+        _this.keyStates[event.code] = true;
+        _this.keyStates.isDown = true;
+      }
+    }, false);
+
+    // 键盘释放事件
+    document.addEventListener("keyup", (event) => {
+      if (this.isSearchFocused) return;
+
+      // F键返回原视图
+      if (event.code === "KeyF" && _this.lastActiveCamera) {
+        _this.activeCamera = _this.lastActiveCamera;
+        _this.camera = _this.activeCamera;
+        _this.lastActiveCamera = null; // 清除保存的相机状态
+        this.ifTurn = true;
+        _this.showSearchNotification('已返回原视图');
+        return;
+      }
+
+      if(event.code !== 'KeyQ')  {
+        _this.keyStates[event.code] = false;
+        _this.keyStates.isDown = false;
+      }
+
+      // 相机切换 (V键)
+      if (event.code === "KeyV") {
+        // 如果当前是搜索相机，先保存它
+        if (_this.activeCamera === _this.searchCamera) {
+          _this.lastActiveCamera = _this.searchCamera;
+        }
+
+        // 切换到另一个非搜索相机
+        _this.activeCamera = _this.activeCamera === _this.cameraDefault ? _this.robatCamera : _this.cameraDefault;
+        _this.camera = _this.activeCamera;
+      }
+
+      // 打招呼动画 (T键)
+      if (event.code === "KeyT") {
+        _this.actionIF = true;
+        _this.fadeToAction("Wave");
+      }
+    }, false);
+
+    // 鼠标移动控制视角
+    document.addEventListener("mousemove", (event) => {
+      if (this.isSearchFocused) return;
+
+      if(this.ifTurn){
+        // 左右旋转
+        _this.capsule.rotation.y -= event.movementX * 0.005;
+
+        // 上下旋转（限制角度）
+        _this.capsuleBodyControl.rotation.x += event.movementY * 0.003;
+        _this.capsuleBodyControl.rotation.x = Math.max(-Math.PI/7, Math.min(Math.PI/4, _this.capsuleBodyControl.rotation.x));
+
+      }
+    }, false);
+  },
+
+  // 玩家控制逻辑
+  controlsPlayer: function(deltaTime){
+    if (this.isSearchFocused) return;
+
+    const _this = this;
+    const moveSpeed = 15;
+
+    if(_this.keyStates["KeyW"]){
+      const capsuleFront = new THREE.Vector3(0,0,0);
+      _this.capsule.getWorldDirection(capsuleFront);
+      capsuleFront.normalize();
+      _this.playerVelocity.add(capsuleFront.multiplyScalar(-deltaTime * moveSpeed))
+    }
+    if(_this.keyStates["KeyS"]){
+      const capsuleFront = new THREE.Vector3(0,0,0);
+      _this.capsule.getWorldDirection(capsuleFront);
+      capsuleFront.normalize();
+      _this.playerVelocity.add(capsuleFront.multiplyScalar(deltaTime * moveSpeed))
+    }
+    if(_this.keyStates["KeyA"]){
+      const capsuleFront = new THREE.Vector3(0,0,0);
+      _this.capsule.getWorldDirection(capsuleFront);
+      capsuleFront.cross(_this.capsule.up);
+      capsuleFront.normalize();
+      _this.playerVelocity.add(capsuleFront.multiplyScalar(deltaTime * moveSpeed))
+    }
+    if(_this.keyStates["KeyD"]){
+      const capsuleFront = new THREE.Vector3(0,0,0);
+      _this.capsule.getWorldDirection(capsuleFront);
+      capsuleFront.cross(_this.capsule.up);
+      capsuleFront.normalize();
+      _this.playerVelocity.add(capsuleFront.multiplyScalar(-deltaTime * moveSpeed))
+    }
+    if(_this.keyStates["Space"] && _this.playerVelocity.y === 0){
+      _this.playerVelocity.y = 20;
+      _this.fadeToAction("Jump");
+    }
+  },
+
+  // 创建操作提示
+  createRelativeControlsHint: function() {
+    const canvasContainer = this.container;
+
+    if (getComputedStyle(canvasContainer).position === 'static') {
+      canvasContainer.style.position = 'relative';
+    }
+
+    const hintContainer = document.createElement('div');
+    hintContainer.id = 'controls-hint';
+    hintContainer.style.cssText = `
+      position: absolute;
+      bottom: 20px;
+      left: 20px;
+      background-color: rgba(0, 0, 0, 0.7);
+      color: #fff;
+      padding: 15px;
+      border-radius: 8px;
+      font-family: Arial, sans-serif;
+      font-size: 14px;
+      z-index: 10;
+      pointer-events: none;
+      backdrop-filter: blur(4px);
+      transition: opacity 0.3s;
+    `;
+
+    const controls = [
+      { key: 'WASD', action: '移动' },
+      { key: '空格', action: '跳跃' },
+      { key: 'Q/ESC', action: '锁定/解锁鼠标' },
+      { key: 'V', action: '切换视角' },
+      { key: 'F', action: '从搜索视图返回' },
+      { key: 'T', action: '打招呼' },
+      { key: '点击', action: '查看档案' },
+      { key: '搜索框', action: '查找城市或区域（支持：城市 区域 格式）' },
+      { key: 'Tips', action: '推荐使用电脑自带输入法英文模式' }
+    ];
+
+    controls.forEach(item => {
+      const controlItem = document.createElement('div');
+      controlItem.style.cssText = `
+        margin: 5px 0;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      `;
+
+      const keyElement = document.createElement('span');
+      keyElement.className = 'key';
+      keyElement.style.cssText = `
+        display: inline-block;
+        min-width: 40px;
+        height: 30px;
+        background-color: #333;
+        border: 1px solid #666;
+        border-radius: 4px;
+        text-align: center;
+        line-height: 28px;
+        font-weight: bold;
+      `;
+      keyElement.textContent = item.key;
+
+      controlItem.appendChild(keyElement);
+      controlItem.appendChild(document.createTextNode(item.action));
+      hintContainer.appendChild(controlItem);
+    });
+
+    canvasContainer.appendChild(hintContainer);
+  },
+
+  // 动画循环
+  loop: function () {
+    this.animationId = requestAnimationFrame(this.loop.bind(this));
+
+    this.deltaTime = this.clock.getDelta();
+
+    // 更新动画混合器
+    if (this.mixer) {
+      this.mixer.update(this.deltaTime);
+    }
+
+    // 更新玩家状态
+    if (!this.actionIF) {
+      this.updatePlayer(this.deltaTime);
+    }
+
+    // 处理玩家控制
+    this.controlsPlayer(this.deltaTime);
+
+    // 重置玩家位置（如果掉落）
+    this.resetPlayer();
+
+    // 更新标签朝向
+    this.labels.forEach(label => {
+      if (label.update) label.update();
+    });
+
+    // 渲染场景
+    this.renderer.render(this.scene, this.camera);
+    TWEEN.update();
+  },
+
+  // 清理资源
+  destroy: function () {
+    cancelAnimationFrame(this.animationId);
+
+    if (this.scene) {
+      this.scene.traverse((child) => {
+        if (child.isMesh) {
+          if (child.geometry) child.geometry.dispose();
+          if (child.material) {
+            if (Array.isArray(child.material)) {
+              child.material.forEach(m => m.dispose());
+            } else {
+              child.material.dispose();
+            }
+          }
+        }
+      });
+    }
+
+    // 移除指针锁定事件监听
+    document.removeEventListener('pointerlockchange', lockChangeHandler, false);
+    document.removeEventListener('mozpointerlockchange', lockChangeHandler, false);
+    document.removeEventListener('webkitpointerlockchange', lockChangeHandler, false);
+
+    // 移除光标指示器尺寸变化监听器
+    if (this.handleCursorResize) {
+      window.removeEventListener('resize', this.handleCursorResize);
+    }
+
+    // 移除鼠标指示器
+    if (this.cursorIndicator && this.cursorIndicator.parentNode) {
+      this.cursorIndicator.parentNode.removeChild(this.cursorIndicator);
+    }
+
+    // 移除搜索框
+    if (this.searchContainer && this.searchContainer.parentNode) {
+      this.searchContainer.parentNode.removeChild(this.searchContainer);
+    }
+
+    // 移除歧义对话框
+    if (this.ambiguityDialog && this.ambiguityDialog.parentNode) {
+      this.ambiguityDialog.parentNode.removeChild(this.ambiguityDialog);
+    }
+
+    // 移除操作提示
+    const controlsHint = document.getElementById('controls-hint');
+    if (controlsHint && controlsHint.parentNode) {
+      controlsHint.parentNode.removeChild(controlsHint);
+    }
+
+    // 移除其他事件监听
+    window.removeEventListener('resize', this.handleWindowResize);
+    if (this.container) {
+      this.container.removeEventListener('click', this.handleAllRaycasters);
+    }
+
+    // 清空引用
+    this.scene = null;
+    this.camera = null;
+    this.cameraDefault = null;
+    this.robatCamera = null;
+    this.searchCamera = null;
+    this.renderer = null;
+    this.container = null;
+    this.archives = [];
+    this.cabinets = [];
+    this.labels = [];
+    this.group = null;
+    this.mixer = null;
+    this.actions = {};
+  },
+
+  // 在需要展示表格的地方（如按钮点击事件中）调用，包含区域信息
+  handleShowTable: function(districtInfo) {
+    // 模拟表格数据，包含区域信息
+    const tableData = [
+      { id: 1, name: `${districtInfo.name}水利局`, type: '行政单位', year: '1985', staff: 120 },
+    ]
+
+    // 定义表格列配置
+    const columns = [
+      { label: '单位名称', prop: 'name', width: 200 },
+    ]
+
+    // 调用表格对话框，标题包含完整的区域信息
+    tableDialog.showTableDialog({
+      title: `${districtInfo}水利单位信息列表`, // 对话框标题包含完整路径
+      data: tableData,       // 表格数据
+      columns: columns,      // 列配置
+      multiple: true,        // 支持多选（false为单选）
+      width: '90%',          // 对话框宽度
+      height: '90%',       // 表格区域高度
+      // 选择完成后的回调函数
+      onSelect: (selectedRows) => {
+        if (selectedRows.length > 0) {
+          console.log('选中的数据：', selectedRows)
+          // 这里可以处理选中后的数据，如提交表单、展示详情等
+        } else {
+          console.log('未选中任何数据')
+        }
+      },
+      onClose: () => {
+        this.ifTurn = true;
+        for (let i = 0; i < this.archives.length; i++) {
+          this.returnBook(this.archives[i]);
+        }
+      }
+    })
+  }
+};
+
+// 初始化函数
+function onLoad() {
+  const archive3D = Archive3D.init(document.getElementById("world"));
+}
+
+export {Archive3D, onLoad, controls};
