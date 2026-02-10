@@ -590,8 +590,9 @@ class LTGQ(nn.Module):
         rt = self.leaky(self.Wr(torch.cat([r_emb, tau], dim=1)))
         x = torch.tanh(e + rt)
 
-        # QFM (带消融开关)
+        # ==================== QFM 消融开关 ====================
         if self.disable_qfm:
+            # 消融A: QFM完全失效，ei/ri/ti保持原始值，thetas均匀
             ei, ri, ti = e, r_emb, tau
             thetas = torch.ones(e.size(0), 3, device=e.device, dtype=e.dtype) / 3.0
         else:
@@ -602,16 +603,19 @@ class LTGQ(nn.Module):
             thetas = torch.cat([self.We(ei), self.Wr_scalar(ri), self.Wt_scalar(ti)], dim=1)
             thetas = F.softmax(thetas, dim=1)
 
-        # DTM (带消融开关)
+        # ==================== DTM 消融开关 ====================
         if self.disable_dtm:
+            # 消融B: DTM完全失效，x_o直接用基础融合向量x
             x_o = x
         else:
             c1,c2,c3 = self.dtm(tau, tau, tau, x)
             x_o = thetas[:,0:1]*c1 + thetas[:,1:2]*c2 + thetas[:,2:3]*c3
             x_o = torch.tanh(x_o)
 
-        # 历史依赖 (带消融开关)
+        # ==================== 历史依赖模块消融开关 ====================
         if self.disable_history:
+            # 消融C: 历史模块完全失效（TF+CopyNet+门控全部跳过）
+            # q直接从x_o经MLP产生，ri不通过门控参与q的构建
             q = self.final_proj(self.final_ln(x_o))
         else:
             hist_vecs_pool, hist_seq = self.build_history_vectors(h_r,h_o,h_y,h_m,h_d)
@@ -624,6 +628,8 @@ class LTGQ(nn.Module):
             t_gate = torch.sigmoid(self.time_gate(torch.cat([ri, ti], dim=1)))
             q = t_gate * x_hist + (1 - t_gate) * ri
             q = self.final_proj(self.final_ln(q))
+
+        # ==================== 辅助输出（始终执行）====================
         aux_rel_logits = self.aux_rel_head(q) if self.use_aux_rel else None
 
         time_logits = (
