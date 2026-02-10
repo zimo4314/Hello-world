@@ -409,9 +409,11 @@ class LTGQ(nn.Module):
         self.trans_weight = trans_weight
         self.short_hist_size = short_hist_size
         self.long_hist_size = long_hist_size
+        # 消融开关
         self.disable_qfm = disable_qfm
         self.disable_dtm = disable_dtm
         self.disable_history = disable_history
+        logger.info(f"[Ablation] disable_qfm={disable_qfm}, disable_dtm={disable_dtm}, disable_history={disable_history}")
 
         # 共享基 + 头尾角色
         self.ent_emb_shared = nn.Embedding(num_entities+1, dim, padding_idx=pad_ent_id)
@@ -590,9 +592,16 @@ class LTGQ(nn.Module):
         rt = self.leaky(self.Wr(torch.cat([r_emb, tau], dim=1)))
         x = torch.tanh(e + rt)
 
-        # QFM (带消融开关)
+        # ==================== QFM 彻底消融 ====================
+        # QFM产出: ei, ri, ti, thetas
+        # ri 下游使用: 门控回退值(×2), score()的trans/rotate打分
+        # ti 下游使用: 门控输入, score()的trans/rotate打分, contrast_proj_t
+        # ei 下游使用: 仅用于thetas计算
+        # 彻底消融: 全部归零，thetas均匀，下游门控回退=0，score的trans/rotate=0
         if self.disable_qfm:
-            ei, ri, ti = e, r_emb, tau
+            ei = torch.zeros_like(e)
+            ri = torch.zeros_like(r_emb)
+            ti = torch.zeros_like(tau)
             thetas = torch.ones(e.size(0), 3, device=e.device, dtype=e.dtype) / 3.0
         else:
             Q_prev=None
@@ -602,15 +611,22 @@ class LTGQ(nn.Module):
             thetas = torch.cat([self.We(ei), self.Wr_scalar(ri), self.Wt_scalar(ti)], dim=1)
             thetas = F.softmax(thetas, dim=1)
 
-        # DTM (带消融开关)
+        # ==================== DTM 彻底消融 ====================
+        # DTM产出: x_o (由c1,c2,c3经thetas加权)
+        # x_o 下游使用: CopyNet的输入, disable_history时直接变q
+        # 彻底消融: x_o归零，CopyNet收到全零输入，历史信息无法注入查询
         if self.disable_dtm:
-            x_o = x
+            x_o = torch.zeros_like(x)
         else:
             c1,c2,c3 = self.dtm(tau, tau, tau, x)
             x_o = thetas[:,0:1]*c1 + thetas[:,1:2]*c2 + thetas[:,2:3]*c3
             x_o = torch.tanh(x_o)
 
-        # 历史依赖 (带消融开关)
+        # ==================== 历史依赖模块彻底消融 ====================
+        # 历史模块产出: q (通过TF+CopyNet+双层门控)
+        # 彻底消融: 跳过build_history_vectors, CopyNet, 双层门控全部跳过
+        # q直接从x_o产生, 历史信息完全不参与
+        # 注意: ri,ti保持正常值传给score()用于trans/rotate打分(打分模块不属于历史模块)
         if self.disable_history:
             q = self.final_proj(self.final_ln(x_o))
         else:
@@ -624,6 +640,8 @@ class LTGQ(nn.Module):
             t_gate = torch.sigmoid(self.time_gate(torch.cat([ri, ti], dim=1)))
             q = t_gate * x_hist + (1 - t_gate) * ri
             q = self.final_proj(self.final_ln(q))
+
+        # ==================== 辅助输出（始终执行）====================
         aux_rel_logits = self.aux_rel_head(q) if self.use_aux_rel else None
 
         time_logits = (
@@ -1340,9 +1358,9 @@ if __name__ == "__main__":
     parser.add_argument("--vocab_from_train_only", action="store_true", default=True)
 
     # 消融开关
-    parser.add_argument("--disable_qfm", action="store_true", help="Disable QFM module")
-    parser.add_argument("--disable_dtm", action="store_true", help="Disable DTM module")
-    parser.add_argument("--disable_history", action="store_true", help="Disable History module")
+    parser.add_argument("--disable_qfm", action="store_true", help="Ablation: disable QFM module completely (zero out ei,ri,ti)")
+    parser.add_argument("--disable_dtm", action="store_true", help="Ablation: disable DTM module completely (zero out x_o)")
+    parser.add_argument("--disable_history", action="store_true", help="Ablation: disable History module completely (skip TF+CopyNet+gates)")
 
     args = parser.parse_args()
     os.makedirs(args.save_dir, exist_ok=True)
