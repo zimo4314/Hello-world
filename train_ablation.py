@@ -1,0 +1,1349 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+LTGQ++ Fusion 稳定版（修复测试崩溃 & 更强融合）：
+- 仅用训练集构建词表（默认 vocab_from_train_only=True），验证/测试遇到未见实体或原向关系直接跳过，避免 OOV 污染。
+- 角色分离实体向量 + 共享基向量门控融合；历史双尺度（短/长）Transformer + CopyNet。
+- 打分多分支：dot + cosine + translation + 轻量 rotate-phase，权重可调，旋转权重下调防爆炸。
+- 关系/时间联合门控，时间多任务辅助；频率去偏。
+- 难负缓存 + 自对抗难负 + 动态边距/几何调度。
+- SWA/EMA 可选；测试阶段同时评估 best_model 和 SWA，自动择优（避免 SWA 崩溃导致 0 分）。
+"""
+
+import os, math, argparse, random, logging, warnings
+from collections import defaultdict, Counter, deque
+from datetime import datetime
+from functools import partial
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+from torch.cuda.amp import autocast, GradScaler
+from torch.optim.swa_utils import AveragedModel, update_bn
+
+warnings.filterwarnings("ignore", category=UserWarning, module="torch.overrides")
+if hasattr(torch, "set_float32_matmul_precision"):
+    torch.set_float32_matmul_precision("medium")
+torch.backends.cuda.matmul.allow_tf32 = True
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("ltgq")
+
+# ------------------------- Utils -------------------------
+def set_seed(seed: int = 42):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+
+def parse_date(date_str):
+    dt = datetime.strptime(date_str, "%Y-%m-%d"); return dt.year, dt.month, dt.day
+
+def load_csv(path):
+    df = pd.read_csv(path)
+    expected = {"head","relation","tail","timestamp"}
+    if not expected.issubset(df.columns):
+        raise ValueError(f"CSV must contain {expected}; got {df.columns.tolist()}")
+    
+    # --- 新增清洗逻辑 ---
+    
+    # 1. 尝试将日期列转换为 datetime 对象
+    # errors='coerce' 是关键：遇到无法解析的格式（NaN, float, 乱码等）强行转为 NaT
+    temp_dates = pd.to_datetime(df["timestamp"], errors='coerce')
+    
+    # 2. 找出那些转换失败（NaT）的行
+    invalid_mask = temp_dates.isna()
+    if invalid_mask.any():
+        drop_count = invalid_mask.sum()
+        print(f"警告: 在 {path} 中发现并剔除了 {drop_count} 条时间戳无效的数据。")
+        
+        # 3. 直接保留转换成功的行 (从而物理剔除坏数据)
+        df = df[~invalid_mask].copy()
+        temp_dates = temp_dates[~invalid_mask]
+    
+    # 4. 将日期格式化回字符串 (确保 parse_date 接收到的一定是标准 string)
+    df["timestamp"] = temp_dates.dt.strftime("%Y-%m-%d")
+    
+    # -------------------
+
+    return df.drop_duplicates()
+
+def build_mappings(dfs, use_inverse=True):
+    entities, relations, years = set(), set(), set()
+    for df in dfs:
+        for _, row in df.iterrows():
+            entities.add(row["head"]); entities.add(row["tail"])
+            relations.add(row["relation"])
+            y, _, _ = parse_date(row["timestamp"]); years.add(y)
+    ent2id = {e:i for i,e in enumerate(sorted(entities))}
+    rel2id = {r:i for i,r in enumerate(sorted(relations))}
+    base = len(rel2id)
+    if use_inverse:
+        for r,idx in list(rel2id.items()):
+            rel2id[r+"_inv"] = idx + base
+    pad_ent_id = len(ent2id); pad_rel_id = len(rel2id)
+    years = sorted(list(years))
+    year2id  = {y:i for i,y in enumerate(years)}
+    month2id = {m:m-1 for m in range(1,13)}
+    day2id   = {d:d-1 for d in range(1,32)}
+    return ent2id, rel2id, year2id, month2id, day2id, pad_ent_id, pad_rel_id
+
+def df_to_triples(df, ent2id, rel2id, y2i, m2i, d2i, add_inverse=True, drop_oov=False):
+    triples=[]
+    if df is None: return triples
+    for _,row in df.iterrows():
+        h,t,r,ts = row["head"], row["tail"], row["relation"], row["timestamp"]
+        if drop_oov and (h not in ent2id or t not in ent2id): continue
+        if (h not in ent2id) or (t not in ent2id) or (r not in rel2id): continue
+        H,T,R = ent2id[h], ent2id[t], rel2id[r]
+        y,mo,da = parse_date(ts)
+        triples.append((H,R,T, y2i[y], m2i[mo], d2i[da]))
+        if add_inverse:
+            inv = r+"_inv"
+            if inv in rel2id:
+                triples.append((T, rel2id[inv], H, y2i[y], m2i[mo], d2i[da]))
+    return triples
+
+def df_to_triples_with_train_filter(df, ent2id, rel2id, y2i, m2i, d2i,
+                                    train_ent_set=None, train_rel_set=None,
+                                    add_inverse=True):
+    """
+    优化版：只保留训练集中出现过实体、关系以及时间在词表内的样本。
+    增加了对时间(Year)的检查，防止因测试集年份未在训练集中出现导致的Embedding索引越界崩溃。
+    """
+    triples = []
+    if df is None or df.empty:
+        return triples
+
+    original_count = len(df)
+    
+    # 1. 基础转换：将日期字符串转为对象以便提取年份
+    # 注意：在 load_csv 中已经清洗过 timestamp 格式，这里可以直接转换
+    temp_dates = pd.to_datetime(df["timestamp"], errors='coerce')
+    
+    # 2. 构建布尔掩码 (Mask) 进行向量化过滤
+    # (a) 实体检查
+    if train_ent_set is not None:
+        mask_h = df["head"].isin(train_ent_set)
+        mask_t = df["tail"].isin(train_ent_set)
+        ent_mask = mask_h & mask_t
+    else:
+        # 如果没传集合，就看是否在 ent2id 映射表中（兜底）
+        # set(ent2id.keys()) 比较慢，但在 vocab_from_train_only=True 时等价
+        known_ents = set(ent2id.keys())
+        mask_h = df["head"].isin(known_ents)
+        mask_t = df["tail"].isin(known_ents)
+        ent_mask = mask_h & mask_t
+
+    # (b) 关系检查
+    if train_rel_set is not None:
+        rel_mask = df["relation"].isin(train_rel_set)
+    else:
+        known_rels = set(rel2id.keys())
+        rel_mask = df["relation"].isin(known_rels)
+
+    # (c) 时间年份检查 (至关重要，防止年份索引越界)
+    # y2i 包含的是训练集中出现过的年份
+    valid_years = set(y2i.keys())
+    # 提取年份，注意 temp_dates 可能有 NaT (虽然 load_csv 清洗过)
+    years = temp_dates.dt.year
+    time_mask = years.isin(valid_years)
+
+    # 3. 组合所有掩码
+    final_mask = ent_mask & rel_mask & time_mask
+    
+    # 4. 统计并打印过滤信息
+    kept_count = final_mask.sum()
+    dropped_count = original_count - kept_count
+    
+    if dropped_count > 0:
+        logger.warning(f"过滤 OOV 数据: 原数据 {original_count} 条 -> 保留 {kept_count} 条 (剔除 {dropped_count} 条)")
+        logger.warning(f"剔除原因可能是：实体/关系/年份 未在训练集中出现。")
+    
+    # 5. 应用过滤
+    df_clean = df[final_mask].copy()
+    
+    # 6. 快速转换为 Triples
+    # 预先提取需要的列，减少迭代开销
+    heads = df_clean["head"].values
+    tails = df_clean["tail"].values
+    rels = df_clean["relation"].values
+    ts_strs = df_clean["timestamp"].values # 保持字符串用于 parse_date
+    
+    # 这里由于需要精确映射 id 和解析年月日，遍历 clean 数据是必要的，但数据量已经变小
+    for h, t, r, ts in zip(heads, tails, rels, ts_strs):
+        # 这里的 h, t, r 一定在 id map 中，因为前面已经 filter 过了
+        H, T, R = ent2id[h], ent2id[t], rel2id[r]
+        y, mo, da = parse_date(ts)
+        
+        # 二次保险：虽然 mask 检查了年份，但再防一下 Key Error
+        if y not in y2i: continue 
+        
+        Y_idx, M_idx, D_idx = y2i[y], m2i[mo], d2i[da]
+        
+        triples.append((H, R, T, Y_idx, M_idx, D_idx))
+        
+        if add_inverse:
+            inv_r = r + "_inv"
+            if inv_r in rel2id:
+                triples.append((T, rel2id[inv_r], H, Y_idx, M_idx, D_idx))
+                
+    return triples
+
+def build_history_map(triples, history_size):
+    hm = defaultdict(list)
+    for (s,r,o,y,mo,d) in triples:
+        tv = y*10000 + mo*100 + d
+        hm[s].append((r,o,y,mo,d,tv))
+    for k in hm:
+        hm[k].sort(key=lambda x:x[5])
+        if len(hm[k]) > history_size*6:
+            hm[k] = hm[k][-history_size*6:]
+    return hm
+
+def get_history_batch(history_map, s_ids, timestamps, history_size, pad_ent_id, pad_rel_id, hist_mask_dropout=0.0):
+    R,O,Y,M,D = [],[],[],[],[]
+    for idx,s in enumerate(s_ids):
+        y,mo,d = timestamps[idx]; tv = y*10000 + mo*100 + d
+        if history_map is None or s.item() not in history_map:
+            r_seq=[pad_rel_id]*history_size; o_seq=[pad_ent_id]*history_size
+            y_seq=[0]*history_size; m_seq=[0]*history_size; d_seq=[0]*history_size
+        else:
+            events = history_map[s.item()]
+            lo,hi = 0,len(events)
+            while lo < hi:
+                mid=(lo+hi)//2
+                if events[mid][5] < tv: lo=mid+1
+                else: hi=mid
+            selected = events[:lo][-history_size:]
+            pad_len = history_size - len(selected)
+            r_seq=[e[0] for e in selected]; o_seq=[e[1] for e in selected]
+            y_seq=[e[2] for e in selected]; m_seq=[e[3] for e in selected]; d_seq=[e[4] for e in selected]
+            if pad_len>0:
+                r_seq=[pad_rel_id]*pad_len + r_seq
+                o_seq=[pad_ent_id]*pad_len + o_seq
+                y_seq=[0]*pad_len + y_seq; m_seq=[0]*pad_len + m_seq; d_seq=[0]*pad_len + d_seq
+        if hist_mask_dropout>0:
+            L=len(r_seq); mask=torch.rand(L)
+            for j,p in enumerate(mask):
+                if p<hist_mask_dropout:
+                    r_seq[j]=pad_rel_id; o_seq[j]=pad_ent_id; y_seq[j]=0; m_seq[j]=0; d_seq[j]=0
+        R.append(r_seq); O.append(o_seq); Y.append(y_seq); M.append(m_seq); D.append(d_seq)
+    return (torch.tensor(R,dtype=torch.long),
+            torch.tensor(O,dtype=torch.long),
+            torch.tensor(Y,dtype=torch.long),
+            torch.tensor(M,dtype=torch.long),
+            torch.tensor(D,dtype=torch.long))
+
+def build_filter_map(scope, train_triples_raw, valid_triples, test_triples):
+    def to_map(triples):
+        m = defaultdict(set)
+        for (s,r,o,y,mo,d) in triples:
+            m[(s,r,y,mo,d)].add(o)
+        return m
+    if scope=='train_only':
+        fm = to_map(train_triples_raw); return fm, fm
+    if scope=='train_valid':
+        fm_valid = to_map(list(train_triples_raw)+list(valid_triples))
+        fm_test  = to_map(list(train_triples_raw)+list(test_triples))
+        return fm_valid, fm_test
+    if scope=='split_only':
+        fm_valid = to_map(valid_triples); fm_test = to_map(test_triples); return fm_valid, fm_test
+    fm_all = to_map(list(train_triples_raw)+list(valid_triples)+list(test_triples))
+    return fm_all, fm_all
+
+# ------------------------- Dataset -------------------------
+class TemporalKGDataset(Dataset):
+    def __init__(self, triples, history_map, history_size, pad_ent_id, pad_rel_id):
+        self.triples=triples; self.history_map=history_map
+        self.history_size=history_size; self.pad_ent_id=pad_ent_id; self.pad_rel_id=pad_rel_id
+    def __len__(self): return len(self.triples)
+    def __getitem__(self, idx): return self.triples[idx]
+
+def collate_fn(batch, num_entities, neg_sample_size, history_map, history_size, pad_ent_id, pad_rel_id, hist_mask_dropout):
+    s=torch.tensor([x[0] for x in batch]); r=torch.tensor([x[1] for x in batch]); o=torch.tensor([x[2] for x in batch])
+    y=torch.tensor([x[3] for x in batch]); mo=torch.tensor([x[4] for x in batch]); d=torch.tensor([x[5] for x in batch])
+    timestamps=[(x[3],x[4],x[5]) for x in batch]
+    hr,ho,hy,hm,hd = get_history_batch(history_map,s,timestamps,history_size,pad_ent_id,pad_rel_id,hist_mask_dropout)
+    neg_o=None
+    if neg_sample_size and neg_sample_size>0:
+        neg_o = torch.randint(0,pad_ent_id,(len(batch),neg_sample_size),dtype=torch.long)
+    return s,r,o,y,mo,d,hr,ho,hy,hm,hd,neg_o
+
+# ------------------------- Attention -------------------------
+class MultiHeadHistoryAttn(nn.Module):
+    def __init__(self, dim, num_heads=4, attn_dropout=0.1, recency_decay=0.0):
+        super().__init__()
+        assert dim % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.q_proj = nn.Linear(dim, dim, bias=False)
+        self.k_proj = nn.Linear(dim, dim, bias=False)
+        self.v_proj = nn.Linear(dim, dim, bias=False)
+        self.o_proj = nn.Linear(dim, dim)
+        self.scale = self.head_dim ** -0.5
+        self.drop = nn.Dropout(attn_dropout)
+        self.recency_decay = float(recency_decay)
+
+    def forward(self, q, h_emb, h_mask):
+        B, L, D = h_emb.shape
+        qh = self.q_proj(q).view(B, self.num_heads, self.head_dim)
+        kh = self.k_proj(h_emb).view(B, L, self.num_heads, self.head_dim).transpose(1,2)
+        vh = self.v_proj(h_emb).view(B, L, self.num_heads, self.head_dim).transpose(1,2)
+        scores = torch.einsum("Bhd,BHld->BHl", qh, kh) * self.scale
+        if self.recency_decay > 0:
+            pos = torch.arange(L, device=scores.device, dtype=scores.dtype)
+            bias = -self.recency_decay * (L - 1 - pos)
+            scores = scores + bias.view(1,1,L)
+        if h_mask is not None:
+            mask_val = torch.finfo(scores.dtype).min
+            scores = scores.masked_fill(h_mask.unsqueeze(1)==0, mask_val)
+        attn = F.softmax(scores, dim=-1)
+        attn = self.drop(attn)
+        ctx = torch.einsum("BHL,BHLD->BHD", attn, vh).reshape(B, D)
+        return self.o_proj(ctx)
+
+class HistoricalCopyNet(nn.Module):
+    def __init__(self, dim, attn_dropout=0.1, recency_decay=0.0, num_heads=4):
+        super().__init__()
+        self.mha = MultiHeadHistoryAttn(dim, num_heads=num_heads,
+                                        attn_dropout=attn_dropout,
+                                        recency_decay=recency_decay)
+        self.gen_lin=nn.Linear(dim,dim)
+        self.gate=nn.Linear(dim*2,1)
+        self.ln=nn.LayerNorm(dim)
+        self.act=nn.Tanh()
+
+    def forward(self, x, history_embeddings, history_mask):
+        if history_embeddings is None:
+            return self.act(self.gen_lin(x))
+        ctx = self.mha(x, history_embeddings, history_mask)
+        gen = self.act(self.gen_lin(x))
+        fused = self.ln(ctx + x)
+        p_gen = torch.sigmoid(self.gate(torch.cat([gen, fused], dim=1)))
+        return p_gen*gen + (1-p_gen)*fused
+
+# ------------------------- Model Components -------------------------
+class TriAff(nn.Module):
+    def __init__(self, dim, init_std=0.02):
+        super().__init__()
+        self.W = nn.Parameter(torch.randn(dim, dim+1, dim+1) * init_std)
+        self.w_proj = nn.Linear(dim, dim)
+    def forward(self, u,v,w):
+        b,_=u.shape
+        u_p=torch.cat([u, u.new_ones(b,1)], dim=1)
+        v_p=torch.cat([v, v.new_ones(b,1)], dim=1)
+        temp=torch.einsum("bi,kij,bj->bk", u_p, self.W, v_p)
+        w_m=self.w_proj(w)
+        return temp * torch.tanh(w_m)
+
+class CNN1x1(nn.Module):
+    def __init__(self, dim, act=nn.LeakyReLU(0.2)):
+        super().__init__()
+        self.lin=nn.Linear(dim, dim); self.norm=nn.LayerNorm(dim); self.act=act
+    def forward(self,x): return self.act(self.norm(self.lin(x)))
+
+class QFMBlock(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.triaff_agg=TriAff(dim); self.triaff_dist=TriAff(dim)
+        self.cnn_agg=CNN1x1(dim); self.cnn_dist=CNN1x1(dim)
+    def forward(self, e_i, r_i, tau_i, Q_prev=None):
+        if Q_prev is None:
+            Q_prev = torch.zeros_like(e_i)
+        H_agg = self.cnn_agg(self.triaff_agg(e_i, r_i, tau_i))
+        Q = (e_i - Q_prev)*H_agg + (r_i - Q_prev)*H_agg + (tau_i - Q_prev)*H_agg
+        H_dist = self.cnn_dist(self.triaff_dist(e_i, r_i, tau_i))
+        e_next = e_i + (Q - e_i)*H_dist
+        r_next = r_i + (Q - r_i)*H_dist
+        tau_next = tau_i + (Q - tau_i)*H_dist
+        return e_next, r_next, tau_next, Q
+
+class RotationDTM(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        assert dim%2==0
+        self.dim=dim; self.half=dim//2
+        self.to_angle1=nn.Linear(dim,self.half)
+        self.to_angle2=nn.Linear(dim,self.half)
+        self.to_angle3=nn.Linear(dim,self.half)
+        self.post_proj=nn.Linear(dim,dim); self.act=nn.Tanh()
+    def rotate(self,x,theta):
+        xr=x[:,:self.half]; xi=x[:,self.half:]
+        cos=torch.cos(theta); sin=torch.sin(theta)
+        xr_new=xr*cos - xi*sin
+        xi_new=xr*sin + xi*cos
+        return torch.cat([xr_new, xi_new], dim=1)
+    def forward(self,t1,t2,t3,x_input):
+        th1=self.to_angle1(t1); x1=self.rotate(x_input,th1); c1=self.act(self.post_proj(x1))
+        th2=self.to_angle2(t2); x2=self.rotate(x1,th2); c2=self.act(self.post_proj(x2))
+        th3=self.to_angle3(t3); x3=self.rotate(x2,th3); c3=self.act(self.post_proj(x3))
+        return c1,c2,c3
+
+# ------------------------- LTGQ++ Fusion -------------------------
+class LTGQ(nn.Module):
+    def __init__(self, num_entities, num_relations, time_vocab_sizes, pad_ent_id, pad_rel_id,
+                 dim=480, qfm_layers=3, dropout=0.12,
+                 pretrained_ent_emb=None, pretrained_rel_emb=None,
+                 hist_attn_dropout=0.12, recency_decay=0.07,
+                 rel_dropout=0.0, time_dropout=0.0,
+                 use_aux_rel=False,
+                 history_heads=4,
+                 use_adapter=False, adapter_dim=64,
+                 time_fuse="cat", use_sin_time=True,
+                 trans_weight=0.25,
+                 hist_tf_layers=2, hist_tf_heads=8, hist_tf_dropout=0.1,
+                 short_hist_size=20, long_hist_size=60,
+                 disable_qfm=False, disable_dtm=False, disable_history=False):
+        super().__init__()
+        assert dim%2==0
+        self.dim=dim; self.pad_ent_id=pad_ent_id; self.pad_rel_id=pad_rel_id
+        self.rel_dropout=rel_dropout; self.time_dropout=time_dropout
+        self.use_aux_rel = use_aux_rel
+        self.use_adapter = use_adapter
+        self.time_fuse = time_fuse
+        self.use_sin_time = use_sin_time
+        self.trans_weight = trans_weight
+        self.short_hist_size = short_hist_size
+        self.long_hist_size = long_hist_size
+        self.disable_qfm = disable_qfm
+        self.disable_dtm = disable_dtm
+        self.disable_history = disable_history
+
+        # 共享基 + 头尾角色
+        self.ent_emb_shared = nn.Embedding(num_entities+1, dim, padding_idx=pad_ent_id)
+        self.ent_emb_h = nn.Embedding(num_entities+1, dim, padding_idx=pad_ent_id)
+        self.ent_emb_t = nn.Embedding(num_entities+1, dim, padding_idx=pad_ent_id)
+        self.rel_emb=nn.Embedding(num_relations+1, dim, padding_idx=pad_rel_id)
+        self.year_emb=nn.Embedding(time_vocab_sizes["year"], dim)
+        self.month_emb=nn.Embedding(time_vocab_sizes["month"], dim)
+        self.day_emb=nn.Embedding(time_vocab_sizes["day"], dim)
+
+        self.ent_adapter_h = nn.Linear(dim, dim) if use_adapter else None
+        self.ent_adapter_t = nn.Linear(dim, dim) if use_adapter else None
+        self.ent_adapter_s = nn.Linear(dim, dim) if use_adapter else None
+        self.rel_adapter = nn.Linear(dim, dim) if use_adapter else None
+
+        if pretrained_ent_emb is not None:
+            W=torch.from_numpy(pretrained_ent_emb).float()
+            with torch.no_grad():
+                n=min(self.ent_emb_h.num_embeddings, W.size(0))
+                self.ent_emb_h.weight[:n]=W[:n]
+                self.ent_emb_t.weight[:n]=W[:n]
+                self.ent_emb_shared.weight[:n]=W[:n]
+        if pretrained_rel_emb is not None:
+            W=torch.from_numpy(pretrained_rel_emb).float()
+            with torch.no_grad():
+                n=min(self.rel_emb.num_embeddings, W.size(0))
+                self.rel_emb.weight[:n]=W[:n]
+
+        self.ent_cnn=CNN1x1(dim); self.rel_cnn=CNN1x1(dim); self.time_cnn=CNN1x1(dim)
+        self.Wt=nn.Linear(dim*3 if time_fuse=="cat" else dim, dim)
+        self.Wr=nn.Linear(dim*2, dim); self.leaky=nn.LeakyReLU(0.2)
+        self.qfm_blocks=nn.ModuleList([QFMBlock(dim) for _ in range(qfm_layers)])
+        self.dtm=RotationDTM(dim)
+        # 双尺度历史
+        self.hist_tf_short = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=dim, nhead=hist_tf_heads,
+                                       dim_feedforward=dim*2,
+                                       dropout=hist_tf_dropout,
+                                       batch_first=True,
+                                       activation="gelu"),
+            num_layers=max(1, hist_tf_layers//2))
+        self.hist_tf_long = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=dim, nhead=hist_tf_heads,
+                                       dim_feedforward=dim*2,
+                                       dropout=hist_tf_dropout,
+                                       batch_first=True,
+                                       activation="gelu"),
+            num_layers=hist_tf_layers)
+        self.hist_cls = nn.Parameter(torch.zeros(1,1,dim))
+        self.history_net=HistoricalCopyNet(dim, attn_dropout=hist_attn_dropout,
+                                           recency_decay=recency_decay,
+                                           num_heads=history_heads)
+
+        # 打分权重
+        self.We=nn.Linear(dim,1); self.Wr_scalar=nn.Linear(dim,1); self.Wt_scalar=nn.Linear(dim,1)
+        self.mix_w = nn.Parameter(torch.tensor([0.4, 0.4, 0.2]))  # dot, cos, trans
+        self.rotate_w = nn.Parameter(torch.tensor(0.05))
+        self.logit_scale = nn.Parameter(torch.tensor([math.log(12.0)]))
+        self.trans_scale = nn.Parameter(torch.tensor([1.0]))
+        self.rotate_scale = nn.Parameter(torch.tensor([1.0]))
+
+        self.event_proj = nn.Sequential(nn.Linear(dim*3, dim), nn.LeakyReLU(0.2))
+
+        self.final_ln=nn.LayerNorm(dim)
+        self.final_proj=nn.Sequential(nn.Linear(dim,dim), nn.LeakyReLU(0.2), nn.Dropout(dropout))
+        self.time_gate = nn.Linear(dim*2, dim)
+        self.r_time_gate = nn.Linear(dim*2, dim)
+
+        self.contrast_proj_q  = nn.Linear(dim, dim)
+        self.contrast_proj_r  = nn.Linear(dim, dim)
+        self.contrast_proj_t  = nn.Linear(dim, dim)
+
+        if self.use_aux_rel:
+            self.aux_rel_head = nn.Linear(dim, num_relations)
+
+        self.time_head_y = nn.Linear(dim, time_vocab_sizes["year"])
+        self.time_head_m = nn.Linear(dim, time_vocab_sizes["month"])
+        self.time_head_d = nn.Linear(dim, time_vocab_sizes["day"])
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        for emb in [self.ent_emb_h, self.ent_emb_t, self.ent_emb_shared, self.rel_emb, self.year_emb, self.month_emb, self.day_emb]:
+            nn.init.xavier_uniform_(emb.weight)
+        with torch.no_grad():
+            self.ent_emb_h.weight[self.pad_ent_id].fill_(0)
+            self.ent_emb_t.weight[self.pad_ent_id].fill_(0)
+            self.ent_emb_shared.weight[self.pad_ent_id].fill_(0)
+            self.rel_emb.weight[self.pad_rel_id].fill_(0)
+
+    def _norm(self, x, eps=1e-6):
+        return x / x.norm(p=2, dim=-1, keepdim=True).clamp(min=eps)
+
+    def sinusoid(self, idx, dim):
+        device=idx.device
+        half=dim//2
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, half, device=device).float() / half))
+        emb = idx.float().unsqueeze(1) * inv_freq.unsqueeze(0)
+        sin, cos = emb.sin(), emb.cos()
+        out = torch.cat([sin, cos], dim=1)
+        if dim % 2 == 1:
+            out = torch.cat([out, out[:, :1]], dim=1)
+        return out
+
+    def time_embed(self, y, mo, d):
+        t1=self.time_cnn(self.year_emb(y))
+        t2=self.time_cnn(self.month_emb(mo))
+        t3=self.time_cnn(self.day_emb(d))
+        if self.use_sin_time:
+            siny = self.sinusoid(y, self.dim).to(t1.dtype)
+            sinm = self.sinusoid(mo, self.dim).to(t1.dtype)
+            sind = self.sinusoid(d, self.dim).to(t1.dtype)
+            t1 = t1 + siny
+            t2 = t2 + sinm
+            t3 = t3 + sind
+        if self.time_fuse == "cat":
+            t_cat = torch.cat([t1,t2,t3], dim=1)
+        else:
+            t_cat = t1 + t2 + t3
+        return self.leaky(self.Wt(t_cat))
+
+    def _fuse_ent(self, e_shared, e_role, adapter=None):
+        if adapter is not None:
+            e_shared = e_shared + adapter(e_shared)
+            e_role = e_role + adapter(e_role)
+        gate = torch.sigmoid(torch.sum(e_role * e_shared, dim=-1, keepdim=True))
+        return self._norm(gate * e_role + (1 - gate) * e_shared)
+
+    def get_ent_embed_h(self, idx):
+        return self._fuse_ent(self.ent_emb_shared(idx), self.ent_emb_h(idx), self.ent_adapter_h)
+
+    def get_ent_embed_t(self, idx):
+        return self._fuse_ent(self.ent_emb_shared(idx), self.ent_emb_t(idx), self.ent_adapter_t)
+
+    def get_rel_embed(self, idx):
+        out = self.rel_emb(idx)
+        if self.rel_adapter is not None:
+            out = out + self.rel_adapter(out)
+        return self._norm(out)
+
+    def apply_dropout_mask(self, x, drop_prob):
+        if drop_prob <= 0: return x
+        mask=(torch.rand_like(x[:, :1]) > drop_prob).float()
+        return x * mask
+
+    def build_history_vectors(self, h_r, h_o, h_y, h_m, h_d):
+        b,L = h_r.shape
+        flat_r=h_r.view(-1); flat_o=h_o.view(-1)
+        emb_r=self.rel_cnn(self.get_rel_embed(flat_r))
+        emb_o=self.ent_cnn(self.get_ent_embed_t(flat_o))
+        t_tau=self.time_embed(h_y.view(-1), h_m.view(-1), h_d.view(-1))
+        event=torch.cat([emb_r, emb_o, t_tau], dim=1)
+        event=self.event_proj(event).view(b,L,-1)
+        short = event[:, -self.short_hist_size:, :]
+        longv = event[:, -self.long_hist_size:, :]
+        cls = self.hist_cls.expand(b,1,-1)
+        s = torch.cat([cls, short], dim=1)
+        l = torch.cat([cls, longv], dim=1)
+        mask_s = torch.ones(b, s.size(1), device=event.device)
+        mask_l = torch.ones(b, l.size(1), device=event.device)
+        s = self.hist_tf_short(s, src_key_padding_mask=(mask_s==0))
+        l = self.hist_tf_long(l, src_key_padding_mask=(mask_l==0))
+        short_out = s[:,0,:]
+        long_out = l[:,0,:]
+        fused_hist = torch.stack([short_out, long_out], dim=1).mean(dim=1, keepdim=True)
+        return fused_hist, event
+
+    def encode(self, s,r,y,mo,d,h_r,h_o,h_y,h_m,h_d):
+        e=self.ent_cnn(self.get_ent_embed_h(s))
+        r_emb=self.rel_cnn(self.get_rel_embed(r))
+        tau=self.time_embed(y,mo,d)
+
+        r_emb=self.apply_dropout_mask(r_emb, self.rel_dropout)
+        tau=self.apply_dropout_mask(tau, self.time_dropout)
+
+        rt = self.leaky(self.Wr(torch.cat([r_emb, tau], dim=1)))
+        x = torch.tanh(e + rt)
+
+        # QFM (带消融开关)
+        if self.disable_qfm:
+            ei, ri, ti = e, r_emb, tau
+            thetas = torch.ones(e.size(0), 3, device=e.device, dtype=e.dtype) / 3.0
+        else:
+            Q_prev=None
+            ei,ri,ti = e,r_emb,tau
+            for blk in self.qfm_blocks:
+                ei,ri,ti,Q_prev = blk(ei,ri,ti,Q_prev)
+            thetas = torch.cat([self.We(ei), self.Wr_scalar(ri), self.Wt_scalar(ti)], dim=1)
+            thetas = F.softmax(thetas, dim=1)
+
+        # DTM (带消融开关)
+        if self.disable_dtm:
+            x_o = x
+        else:
+            c1,c2,c3 = self.dtm(tau, tau, tau, x)
+            x_o = thetas[:,0:1]*c1 + thetas[:,1:2]*c2 + thetas[:,2:3]*c3
+            x_o = torch.tanh(x_o)
+
+        # 历史依赖 (带消融开关)
+        if self.disable_history:
+            q = self.final_proj(self.final_ln(x_o))
+        else:
+            hist_vecs_pool, hist_seq = self.build_history_vectors(h_r,h_o,h_y,h_m,h_d)
+            hist_mask = (h_o != self.pad_ent_id).long()
+            x_hist = self.history_net(x_o, hist_seq, hist_mask)
+
+            rt_gate = torch.sigmoid(self.r_time_gate(torch.cat([ri, ti], dim=1)))
+            x_hist = rt_gate * x_hist + (1 - rt_gate) * ri
+
+            t_gate = torch.sigmoid(self.time_gate(torch.cat([ri, ti], dim=1)))
+            q = t_gate * x_hist + (1 - t_gate) * ri
+            q = self.final_proj(self.final_ln(q))
+        aux_rel_logits = self.aux_rel_head(q) if self.use_aux_rel else None
+
+        time_logits = (
+            self.time_head_y(q),
+            self.time_head_m(q),
+            self.time_head_d(q),
+        )
+
+        q_c = F.normalize(self.contrast_proj_q(q), dim=-1)
+        r_c = F.normalize(self.contrast_proj_r(r_emb), dim=-1)
+        t_c = F.normalize(self.contrast_proj_t(ti), dim=-1)
+        contrast_feats = (q_c, r_c, t_c)
+
+        return q, aux_rel_logits, contrast_feats, (ri, ti), time_logits
+
+    def score(self, q, ent_emb, ri=None, ti=None):
+        dot = (q * ent_emb).sum(-1)
+        cos = F.normalize(q, dim=-1) * F.normalize(ent_emb, dim=-1)
+        cos = cos.sum(-1)
+        logit_scale = torch.clamp(self.logit_scale.exp(), min=0.1, max=80.0)
+        cos = cos * logit_scale
+
+        trans_score = 0
+        if ri is not None and ti is not None and self.trans_weight > 0:
+            trans_score = -((q + ri - ti - ent_emb).norm(p=2, dim=-1)) * self.trans_scale
+
+        rotate_score = 0
+        if ri is not None and ti is not None:
+            half = ent_emb.size(-1)//2
+            ent_r = ent_emb[..., :half]; ent_i = ent_emb[..., half:]
+            q_r   = q[..., :half]; q_i = q[..., half:]
+            r_r   = ri[..., :half]; r_i = ri[..., half:]
+            t_r   = ti[..., :half]; t_i = ti[..., half:]
+            real = q_r + r_r - t_r - ent_r
+            imag = q_i + r_i - t_i - ent_i
+            rotate_score = -(real.pow(2)+imag.pow(2)).sum(-1).sqrt() * self.rotate_scale
+
+        w = F.softmax(self.mix_w, dim=0)
+        mix_score = w[0]*dot + w[1]*cos + w[2]*trans_score + self.rotate_w*rotate_score
+        return mix_score
+
+    def forward(self, s,r,o,y,mo,d,h_r,h_o,h_y,h_m,h_d, neg_o=None, mode="train"):
+        q, aux_rel_logits, contrast_feats, (ri, ti), time_logits = self.encode(s,r,y,mo,d,h_r,h_o,h_y,h_m,h_d)
+        if mode=="train":
+            pos_emb = self.get_ent_embed_t(o)
+            pos_scores = self.score(q, pos_emb, ri, ti)
+            neg_emb = self.get_ent_embed_t(neg_o)
+            neg_scores = self.score(q.unsqueeze(1).expand_as(neg_emb), neg_emb, ri.unsqueeze(1), ti.unsqueeze(1))
+            return pos_scores, neg_scores, aux_rel_logits, contrast_feats, time_logits
+        elif mode=="predict":
+            all_idx = torch.arange(self.pad_ent_id, device=s.device, dtype=torch.long)
+            all_emb = self.get_ent_embed_t(all_idx)
+            return self.score(q.unsqueeze(1), all_emb.unsqueeze(0), ri.unsqueeze(1), ti.unsqueeze(1))
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+
+# ------------------------- EMA -------------------------
+class EMA:
+    def __init__(self, model, decay=0.999):
+        self.decay=decay; self.shadow={}; self.backup={}
+        for n,p in model.named_parameters():
+            if p.requires_grad: self.shadow[n]=p.data.clone()
+    def update(self, model):
+        for n,p in model.named_parameters():
+            if p.requires_grad:
+                self.shadow[n] = (1-self.decay)*p.data + self.decay*self.shadow[n]
+    def apply_shadow(self, model):
+        self.backup={}
+        for n,p in model.named_parameters():
+            if p.requires_grad:
+                self.backup[n]=p.data.clone()
+                p.data=self.shadow[n]
+    def restore(self, model):
+        for n,p in model.named_parameters():
+            if n in self.backup: p.data=self.backup[n]
+        self.backup={}
+
+# ------------------------- FGM adversarial -------------------------
+class FGM:
+    def __init__(self, model, emb_names=("ent_emb_h","ent_emb_t","ent_emb_shared"), epsilon=5e-2):
+        self.model=model
+        self.emb_names=emb_names
+        self.epsilon=epsilon
+        self.backup={}
+    def attack(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and any(en in name for en in self.emb_names):
+                if param.grad is None: continue
+                self.backup[name]=param.data.clone()
+                norm = torch.norm(param.grad)
+                if norm != 0:
+                    r_at = self.epsilon * param.grad / norm
+                    param.data.add_(r_at)
+    def restore(self):
+        for name, param in self.model.named_parameters():
+            if name in self.backup:
+                param.data = self.backup[name]
+        self.backup={}
+
+# ------------------------- Hard negative cache & schedulers -------------------------
+class NegCache:
+    def __init__(self, num_rels, bucket_size=512, share_across_rel=True):
+        self.share = share_across_rel
+        self.bucket_size = bucket_size
+        self.global_q = deque(maxlen=bucket_size) if share_across_rel else None
+        self.rel_q = {r: deque(maxlen=bucket_size) for r in range(num_rels)} if not share_across_rel else None
+
+    def push(self, rel_ids, neg_ids, neg_scores):
+        topk = neg_scores.topk(k=min(8, neg_scores.size(1)), dim=1).indices
+        hard_ids = torch.gather(neg_ids, 1, topk)
+        for i, r in enumerate(rel_ids.tolist()):
+            for nid in hard_ids[i].tolist():
+                if self.share:
+                    self.global_q.append(nid)
+                else:
+                    self.rel_q[r].append(nid)
+
+    def sample(self, rel_ids, k, pad_ent_id):
+        device = rel_ids.device
+        out = []
+        for r in rel_ids.tolist():
+            pool = self.global_q if self.share else self.rel_q.get(r, None)
+            if pool and len(pool) > 0:
+                idx = torch.randint(0, len(pool), (k,), device=device)
+                ids = torch.tensor([pool[j] for j in idx], device=device)
+            else:
+                ids = torch.full((k,), pad_ent_id, device=device)
+            out.append(ids)
+        return torch.stack(out, dim=0)
+
+def get_sched_coeff(step, total, mode="cos"):
+    t = step / max(1, total)
+    if mode == "cos":
+        return 0.5 - 0.5 * math.cos(math.pi * t)
+    return t
+
+def update_dynamic_margins(args, global_step, total_steps):
+    coeff = get_sched_coeff(global_step, total_steps, mode="cos")
+    args.curr_pos_margin = args.pos_margin * (0.7 + 0.3 * coeff)
+    args.curr_neg_margin = args.neg_margin * (1.0 - 0.5 * coeff)
+    args.curr_trans_weight = args.trans_weight * (0.2 + 0.8 * coeff)
+
+# ------------------------- Loss helpers -------------------------
+def compute_loss_adv(pos_scores, neg_scores, args):
+    pos_scores = pos_scores + getattr(args, "curr_pos_margin", args.pos_margin)
+    neg_scores = neg_scores - getattr(args, "curr_neg_margin", args.neg_margin)
+    with torch.no_grad():
+        adv_w = F.softmax(neg_scores * args.adv_neg_temp, dim=1)
+    neg_weighted = (adv_w * neg_scores).sum(dim=1)
+    if args.loss_type == "info_nce":
+        pos = pos_scores.unsqueeze(1) / args.nce_temp_pos
+        neg = neg_scores / args.nce_temp_neg
+        logits = torch.cat([pos, neg], dim=1)
+        labels = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
+        return F.cross_entropy(logits, labels)
+    pos_loss = -F.logsigmoid(pos_scores).mean()
+    neg_loss = -F.logsigmoid(-neg_weighted).mean()
+    return 0.5 * (pos_loss + neg_loss)
+
+def add_embedding_l2(model, loss, reg_lambda):
+    if reg_lambda<=0: return loss
+    emb_norm = (model.ent_emb_h.weight.norm(2)+model.ent_emb_t.weight.norm(2)+model.ent_emb_shared.weight.norm(2)+
+                model.rel_emb.weight.norm(2)+
+                model.year_emb.weight.norm(2)+model.month_emb.weight.norm(2)+
+                model.day_emb.weight.norm(2))/7.0
+    return loss + reg_lambda*emb_norm
+
+def rdrop_kl(logits1, logits2):
+    p1=F.log_softmax(logits1,dim=-1); p2=F.log_softmax(logits2,dim=-1)
+    kl1=F.kl_div(p1, p2.exp(), reduction="batchmean")
+    kl2=F.kl_div(p2, p1.exp(), reduction="batchmean")
+    return 0.5*(kl1+kl2)
+
+def rdrop_loss_on_scores(pos1, neg1, pos2, neg2, alpha):
+    logit1 = torch.cat([pos1.unsqueeze(1), neg1], dim=1)
+    logit2 = torch.cat([pos2.unsqueeze(1), neg2], dim=1)
+    return alpha * rdrop_kl(logit1, logit2)
+
+def apply_freq_bias(neg_scores, neg_o, rel_ids, ent_freq_t, rel_freq_t, args):
+    if args.rel_freq_beta!=0.0:
+        rel_bias = args.rel_freq_beta * torch.log(rel_freq_t[rel_ids].unsqueeze(1)+1e-6)
+        neg_scores = neg_scores - rel_bias
+    if args.ent_freq_alpha!=0.0:
+        ent_bias = args.ent_freq_alpha * torch.log(ent_freq_t[neg_o]+1e-6)
+        neg_scores = neg_scores - ent_bias
+    return neg_scores
+
+def contrastive_loss(q, k, temp=0.2):
+    logits = torch.matmul(q, k.t()) / temp
+    labels = torch.arange(q.size(0), device=q.device)
+    return F.cross_entropy(logits, labels)
+
+def time_aux_loss(time_logits, y, mo, d, w_y, w_m, w_d, label_smoothing=0.0):
+    y_logit, m_logit, d_logit = time_logits
+    loss_y = F.cross_entropy(y_logit, y, label_smoothing=label_smoothing)
+    loss_m = F.cross_entropy(m_logit, mo, label_smoothing=label_smoothing)
+    loss_d = F.cross_entropy(d_logit, d, label_smoothing=label_smoothing)
+    return w_y*loss_y + w_m*loss_m + w_d*loss_d
+
+# ------------------------- Eval helper -------------------------
+@torch.no_grad()
+def score_all_entities_chunked(model, q, ri, ti, chunk_size):
+    device = q.device
+    ent_count = model.pad_ent_id
+    scores_cpu = []
+    ent_idx = torch.arange(ent_count, device=device, dtype=torch.long)
+    for start in range(0, ent_count, chunk_size):
+        end = min(start + chunk_size, ent_count)
+        idx = ent_idx[start:end]
+        emb = model.get_ent_embed_t(idx)
+        sc = model.score(q.unsqueeze(1), emb.unsqueeze(0), ri.unsqueeze(1), ti.unsqueeze(1))
+        scores_cpu.append(sc.detach().cpu())
+    return torch.cat(scores_cpu, dim=1)
+
+# ------------------------- Freq tensors -------------------------
+def build_freq_tensors(triples, pad_ent_id, pad_rel_id, device):
+    ent_counter=Counter(); rel_counter=Counter()
+    for (s,r,o,y,mo,d) in triples:
+        ent_counter[s]+=1; ent_counter[o]+=1; rel_counter[r]+=1
+    ent_freq=torch.ones(pad_ent_id+1,dtype=torch.float)
+    rel_freq=torch.ones(pad_rel_id+1,dtype=torch.float)
+    for k,v in ent_counter.items():
+        if k<ent_freq.numel(): ent_freq[k]=float(v)
+    for k,v in rel_counter.items():
+        if k<rel_freq.numel(): rel_freq[k]=float(v)
+    return ent_freq.to(device), rel_freq.to(device)
+
+# ------------------------- Train / Eval -------------------------
+def build_inbatch_neg(o_ids):
+    b = o_ids.size(0)
+    idx = torch.roll(torch.arange(b, device=o_ids.device), shifts=1)
+    return o_ids[idx].unsqueeze(1)
+
+def train_step(model,batch,optimizer,scaler,args,device,fgm,neg_cache,ent_freq_t=None,rel_freq_t=None, use_rdrop=False):
+    s,r,o,y,mo,d,hr,ho,hy,hm,hd,neg_o = batch
+    s=s.to(device, non_blocking=True); r=r.to(device, non_blocking=True); o=o.to(device, non_blocking=True)
+    y=y.to(device, non_blocking=True); mo=mo.to(device, non_blocking=True); d=d.to(device, non_blocking=True)
+    hr=hr.to(device, non_blocking=True); ho=ho.to(device, non_blocking=True)
+    hy=hy.to(device, non_blocking=True); hm=hm.to(device, non_blocking=True); hd=hd.to(device, non_blocking=True)
+    neg_o=neg_o.to(device, non_blocking=True)
+
+    if args.use_inbatch_neg:
+        inb = build_inbatch_neg(o)
+        neg_o = torch.cat([neg_o, inb], dim=1)
+    if args.cache_neg_k > 0 and neg_cache is not None:
+        extra_hard = neg_cache.sample(r, k=args.cache_neg_k, pad_ent_id=model.pad_ent_id)
+        neg_o = torch.cat([neg_o, extra_hard], dim=1)
+
+    with autocast(dtype=torch.bfloat16 if args.use_bf16 else torch.float16,
+                  enabled=args.use_amp or args.use_bf16):
+        pos1, neg1, aux1, cf1, time_logits = model(s,r,o,y,mo,d,hr,ho,hy,hm,hd,neg_o,mode="train")
+        if (ent_freq_t is not None) or (rel_freq_t is not None):
+            neg1 = apply_freq_bias(neg1, neg_o, r, ent_freq_t, rel_freq_t, args)
+
+        loss_main = compute_loss_adv(pos1, neg1, args)
+        loss_main = add_embedding_l2(model, loss_main, args.reg_lambda)
+
+        if args.use_dual_loss:
+            pos = pos1.unsqueeze(1)/args.nce_temp_pos
+            neg = neg1/args.nce_temp_neg
+            logits = torch.cat([pos, neg], dim=1)
+            labels = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
+            loss_aux = F.cross_entropy(logits, labels)
+            loss_main = (1-args.dual_alpha)*loss_main + args.dual_alpha*loss_aux
+
+        if args.use_aux_rel and aux1 is not None:
+            loss_rel = F.cross_entropy(aux1, r.clamp_max(model.rel_emb.num_embeddings-1))
+            loss_main = loss_main + args.aux_rel_weight * loss_rel
+
+        if cf1 is not None:
+            q_c, r_c, t_c = cf1
+            loss_cr = contrastive_loss(q_c, r_c, temp=args.contrast_temp)
+            loss_ct = contrastive_loss(q_c, t_c, temp=args.contrast_temp)
+            loss_main = loss_main + args.contrast_weight * (loss_cr + loss_ct)
+
+        if args.time_aux_weight > 0:
+            loss_time = time_aux_loss(time_logits, y, mo, d,
+                                      w_y=args.time_aux_weight,
+                                      w_m=args.time_aux_weight*0.5,
+                                      w_d=args.time_aux_weight*0.5,
+                                      label_smoothing=args.time_label_smoothing)
+            loss_main = loss_main + loss_time
+
+        if use_rdrop:
+            pos2, neg2, aux2, cf2, time_logits2 = model(s,r,o,y,mo,d,hr,ho,hy,hm,hd,neg_o,mode="train")
+            if (ent_freq_t is not None) or (rel_freq_t is not None):
+                neg2 = apply_freq_bias(neg2, neg_o, r, ent_freq_t, rel_freq_t, args)
+            loss_main = loss_main + rdrop_loss_on_scores(pos1, neg1, pos2, neg2, args.rdrop_alpha)
+            if args.use_aux_rel and aux1 is not None and aux2 is not None:
+                loss_main = loss_main + args.aux_rel_weight * rdrop_kl(aux1, aux2)
+
+    if torch.isnan(loss_main):
+        return loss_main
+
+    scaler.scale(loss_main / args.accum_steps).backward()
+
+    if args.use_fgm and fgm is not None:
+        fgm.attack()
+        with autocast(dtype=torch.bfloat16 if args.use_bf16 else torch.float16,
+                      enabled=args.use_amp or args.use_bf16):
+            pos_adv, neg_adv, aux_adv, cf_adv, time_logits_adv = model(s,r,o,y,mo,d,hr,ho,hy,hm,hd,neg_o,mode="train")
+            if (ent_freq_t is not None) or (rel_freq_t is not None):
+                neg_adv = apply_freq_bias(neg_adv, neg_o, r, ent_freq_t, rel_freq_t, args)
+            loss_adv = compute_loss_adv(pos_adv, neg_adv, args)
+            loss_adv = add_embedding_l2(model, loss_adv, args.reg_lambda)
+            if args.use_dual_loss:
+                pos = pos_adv.unsqueeze(1)/args.nce_temp_pos
+                neg = neg_adv/args.nce_temp_neg
+                logits = torch.cat([pos, neg], dim=1)
+                labels = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
+                loss_aux = F.cross_entropy(logits, labels)
+                loss_adv = (1-args.dual_alpha)*loss_adv + args.dual_alpha*loss_aux
+            if args.use_aux_rel and aux_adv is not None:
+                loss_rel = F.cross_entropy(aux_adv, r.clamp_max(model.rel_emb.num_embeddings-1))
+                loss_adv = loss_adv + args.aux_rel_weight * loss_rel
+            if cf_adv is not None:
+                q_c, r_c, t_c = cf_adv
+                loss_cr = contrastive_loss(q_c, r_c, temp=args.contrast_temp)
+                loss_ct = contrastive_loss(q_c, t_c, temp=args.contrast_temp)
+                loss_adv = loss_adv + args.contrast_weight * (loss_cr + loss_ct)
+            if args.time_aux_weight > 0:
+                loss_time = time_aux_loss(time_logits_adv, y, mo, d,
+                                          w_y=args.time_aux_weight,
+                                          w_m=args.time_aux_weight*0.5,
+                                          w_d=args.time_aux_weight*0.5,
+                                          label_smoothing=args.time_label_smoothing)
+                loss_adv = loss_adv + loss_time
+        scaler.scale(loss_adv / args.accum_steps).backward()
+        fgm.restore()
+
+    if args.cache_neg_k > 0 and neg_cache is not None:
+        neg_cache.push(r.detach().cpu(), neg_o.detach().cpu(), neg1.detach().cpu())
+
+    return loss_main
+
+@torch.no_grad()
+def evaluate_with_scope(model, dataset, ent_count, device, args, filter_map, desc="Eval"):
+    model.eval()
+    base_model = model.module if hasattr(model, "module") else model
+    loader = DataLoader(
+        dataset, batch_size=args.eval_batch_size, shuffle=False,
+        num_workers=max(0,args.num_workers), pin_memory=True,
+        persistent_workers=True if args.num_workers>0 else False,
+        prefetch_factor=args.prefetch_factor if args.num_workers>0 else None,
+        collate_fn=partial(collate_fn, num_entities=ent_count, neg_sample_size=0,
+                           history_map=dataset.history_map, history_size=dataset.history_size,
+                           pad_ent_id=dataset.pad_ent_id, pad_rel_id=dataset.pad_rel_id,
+                           hist_mask_dropout=0.0)
+    )
+    ranks=[]
+    for batch in tqdm(loader, desc=desc, leave=False):
+        s,r,o,y,mo,d,hr,ho,hy,hm,hd,_ = batch
+        s=s.to(device, non_blocking=True); r=r.to(device, non_blocking=True); o=o.to(device, non_blocking=True)
+        y=y.to(device, non_blocking=True); mo=mo.to(device, non_blocking=True); d=d.to(device, non_blocking=True)
+        hr=hr.to(device, non_blocking=True); ho=ho.to(device, non_blocking=True)
+        hy=hy.to(device, non_blocking=True); hm=hm.to(device, non_blocking=True); hd=hd.to(device, non_blocking=True)
+
+        q, _, _, (ri, ti), _ = base_model.encode(s,r,y,mo,d,hr,ho,hy,hm,hd)
+        scores = score_all_entities_chunked(base_model, q, ri, ti, args.score_chunk_size)
+        for i in range(scores.size(0)):
+            key=(s[i].item(), r[i].item(), y[i].item(), mo[i].item(), d[i].item())
+            gt=o[i].item()
+            for cand in filter_map.get(key,set()):
+                if cand!=gt and cand < scores.size(1):
+                    scores[i,cand] = -1e-9
+            true_score = scores[i, gt].item()
+            rank = int((scores[i] > true_score).sum().item()) + 1
+            ranks.append(rank)
+    ranks=np.array(ranks,dtype=np.int32)
+    mrr=float((1.0/ranks).mean()); h1=float((ranks<=1).mean())
+    h3=float((ranks<=3).mean()); h10=float((ranks<=10).mean())
+    return {"MRR":mrr,"H@1":h1,"H@3":h3,"H@10":h10}
+
+# ------------------------- Main -------------------------
+def main(args):
+    set_seed(42)
+    device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Using device: {device}")
+
+    train_df=load_csv(args.train_path)
+    valid_df=load_csv(args.valid_path) if args.valid_path else None
+    test_df = load_csv(args.test_path) if args.test_path else None
+
+    if args.vocab_from_train_only:
+        ent2id, rel2id, y2i, m2i, d2i, pad_ent_id, pad_rel_id = build_mappings([train_df], use_inverse=not args.no_inverse)
+    else:
+        ent2id, rel2id, y2i, m2i, d2i, pad_ent_id, pad_rel_id = build_mappings(
+            [df for df in [train_df, valid_df, test_df] if df is not None], use_inverse=not args.no_inverse
+        )
+    # ... (加载 csv 代码) ...
+    
+    logger.info(f"Entities: {len(ent2id)}, Relations: {len(rel2id)}")
+
+    # ------------------ 修改开始 ------------------
+    # 构建训练集实体和关系的集合（Raw String 集合）
+    train_entities = set(train_df["head"]).union(set(train_df["tail"]))
+    train_relations = set(train_df["relation"])
+    
+    # 这里的 drop_oov=True 配合 vocab_from_train_only 使用
+    # 即使不加 drop_oov，df_to_triples 内部也有判断，但为了逻辑清晰保留
+    train_raw = df_to_triples(train_df, ent2id, rel2id, y2i, m2i, d2i, add_inverse=False, drop_oov=True)
+    train_triples = df_to_triples(train_df, ent2id, rel2id, y2i, m2i, d2i, add_inverse=not args.no_inverse, drop_oov=True)
+
+    logger.info("Processing Valid Set with OOV Filter...")
+    valid_triples = df_to_triples_with_train_filter(
+        valid_df, ent2id, rel2id, y2i, m2i, d2i,
+        train_ent_set=train_entities,
+        train_rel_set=train_relations,
+        add_inverse=False # 验证集通常只评估正向，不需要加逆向用于训练
+    ) if valid_df is not None else []
+
+    logger.info("Processing Test Set with OOV Filter...")
+    test_triples = df_to_triples_with_train_filter(
+        test_df, ent2id, rel2id, y2i, m2i, d2i,
+        train_ent_set=train_entities,
+        train_rel_set=train_relations,
+        add_inverse=False
+    ) if test_df is not None else []
+
+    logger.info("Building History...")
+    history_map = build_history_map(train_raw, args.history_size)
+    filter_map_valid, filter_map_test = build_filter_map(args.filter_scope, train_raw, valid_triples, test_triples)
+
+    train_ds = TemporalKGDataset(train_triples, history_map, args.history_size, pad_ent_id, pad_rel_id)
+    train_loader = DataLoader(
+        train_ds, batch_size=args.batch_size, shuffle=True,
+        num_workers=max(0,args.num_workers), pin_memory=True,
+        persistent_workers=True if args.num_workers>0 else False,
+        prefetch_factor=args.prefetch_factor if args.num_workers>0 else None,
+        collate_fn=partial(
+            collate_fn,
+            num_entities=len(ent2id),
+            neg_sample_size=args.neg_sample_size,
+            history_map=history_map,
+            history_size=args.history_size,
+            pad_ent_id=pad_ent_id,
+            pad_rel_id=pad_rel_id,
+            hist_mask_dropout=args.hist_mask_dropout,
+        ),
+    )
+
+    ent_init = np.load(args.pretrained_ent) if args.pretrained_ent and os.path.exists(args.pretrained_ent) else None
+    rel_init = np.load(args.pretrained_rel) if args.pretrained_rel and os.path.exists(args.pretrained_rel) else None
+
+    model = LTGQ(
+        num_entities=len(ent2id),
+        num_relations=len(rel2id),
+        time_vocab_sizes={"year": len(y2i), "month": len(m2i), "day": len(d2i)},
+        pad_ent_id=pad_ent_id,
+        pad_rel_id=pad_rel_id,
+        dim=args.dim,
+        qfm_layers=args.qfm_layers,
+        dropout=args.dropout,
+        pretrained_ent_emb=ent_init,
+        pretrained_rel_emb=rel_init,
+        hist_attn_dropout=args.hist_attn_dropout,
+        recency_decay=args.recency_decay,
+        rel_dropout=args.rel_dropout,
+        time_dropout=args.time_dropout,
+        use_aux_rel=args.use_aux_rel,
+        history_heads=args.history_heads,
+        use_adapter=args.use_adapter,
+        adapter_dim=args.adapter_dim,
+        time_fuse=args.time_fuse,
+        use_sin_time=not args.no_sin_time,
+        trans_weight=args.trans_weight,
+        hist_tf_layers=args.hist_tf_layers,
+        hist_tf_heads=args.hist_tf_heads,
+        hist_tf_dropout=args.hist_tf_dropout,
+        short_hist_size=args.short_hist_size,
+        long_hist_size=args.long_hist_size,
+        disable_qfm=args.disable_qfm,
+        disable_dtm=args.disable_dtm,
+        disable_history=args.disable_history,
+    ).to(device)
+
+    use_fused=False
+    if torch.cuda.is_available():
+        try:
+            _ = torch.optim.AdamW(model.parameters(), lr=args.lr, fused=True)
+            use_fused=True
+        except TypeError:
+            use_fused=False
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5, fused=use_fused) if use_fused \
+                else torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    logger.info("Using fused AdamW." if use_fused else "Using standard AdamW.")
+
+    total_steps = len(train_loader) * args.epochs
+    warmup_steps = args.warmup_steps if args.warmup_steps > 0 else int(total_steps * args.warmup_ratio)
+    eta_min = args.lr * args.eta_min_ratio
+    scheduler = None
+    if args.use_cosine:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(1, total_steps - warmup_steps), eta_min=eta_min
+        )
+        logger.info(f"Using CosineAnnealingLR with warmup_steps={warmup_steps}, eta_min={eta_min:.2e}")
+    else:
+        logger.info("Cosine scheduler disabled; using constant LR.")
+
+    scaler = GradScaler(enabled=args.use_amp or args.use_bf16)
+    ema = EMA(model, decay=args.ema_decay) if args.use_ema else None
+    fgm = FGM(model, emb_names=("ent_emb_h","ent_emb_t","ent_emb_shared"), epsilon=args.fgm_epsilon) if args.use_fgm else None
+
+    neg_cache = NegCache(num_rels=len(rel2id),
+                         bucket_size=args.cache_bucket_size,
+                         share_across_rel=not args.no_cache_share_across_rel) if args.cache_neg_k > 0 else None
+
+    swa_model = AveragedModel(model) if args.use_swa else None
+    swa_start_step = int(total_steps * args.swa_start_ratio) if args.use_swa else None
+    swa_scheduler = torch.optim.swa_utils.SWALR(optimizer, swa_lr=args.swa_lr) if args.use_swa else None
+    global_step = 0
+
+    best_mrr = 0.0
+    patience_cnt = 0
+    os.makedirs(args.save_dir, exist_ok=True)
+    ent_freq_t, rel_freq_t = build_freq_tensors(train_raw, pad_ent_id, pad_rel_id, device)
+
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        total_loss = 0.0
+        skipped = 0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
+        optimizer.zero_grad(set_to_none=True)
+        for step, batch in enumerate(pbar):
+            global_step += 1
+            update_dynamic_margins(args, global_step, total_steps)
+            model.trans_weight = args.curr_trans_weight
+
+            loss = train_step(model, batch, optimizer, scaler, args, device, fgm, neg_cache, ent_freq_t, rel_freq_t, use_rdrop=args.use_rdrop)
+            if torch.isnan(loss):
+                optimizer.zero_grad(set_to_none=True)
+                skipped += 1
+                continue
+            loss_log = loss.item()
+            loss = loss / args.accum_steps
+
+            if (step + 1) % args.accum_steps == 0:
+                if args.grad_clip > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                scaler.step(optimizer); scaler.update(); optimizer.zero_grad(set_to_none=True)
+
+                if scheduler is not None:
+                    if global_step <= warmup_steps and warmup_steps > 0:
+                        lr_scale = global_step / float(warmup_steps)
+                        for pg in optimizer.param_groups: pg["lr"] = args.lr * lr_scale
+                    else:
+                        scheduler.step()
+
+                if ema is not None:
+                    ema.update(model)
+
+                if args.use_swa and swa_model is not None and global_step >= swa_start_step and (global_step - swa_start_step) % args.swa_freq == 0:
+                    swa_model.update_parameters(model)
+                    if swa_scheduler is not None:
+                        swa_scheduler.step()
+
+            total_loss += loss_log
+            pbar.set_postfix({"loss": f"{loss_log:.4f}", "skip": skipped})
+
+        avg_loss = total_loss / max(1, len(train_loader))
+        logger.info(f"Epoch {epoch} avg loss: {avg_loss:.6f}, skipped {skipped}")
+
+        if args.valid_path and len(valid_triples) > 0 and epoch % args.eval_freq == 0:
+            if ema is not None: ema.apply_shadow(model)
+            val_ds = TemporalKGDataset(valid_triples, history_map, args.history_size, pad_ent_id, pad_rel_id)
+            val_metrics = evaluate_with_scope(model, val_ds, len(ent2id), device, args, filter_map_valid, desc="Eval-Valid")
+            logger.info(f"Validation: {val_metrics}")
+
+            if val_metrics["MRR"] > best_mrr:
+                best_mrr = val_metrics["MRR"]
+                patience_cnt = 0
+                torch.save(model.state_dict(), os.path.join(args.save_dir, "best_model.pt"))
+                logger.info("Saved best model.")
+            else:
+                patience_cnt += 1
+                if patience_cnt >= args.patience:
+                    logger.info("Early stopping triggered.")
+                    break
+            if ema is not None: ema.restore(model)
+
+    if args.test_path and len(test_triples) > 0:
+        best_path = os.path.join(args.save_dir, "best_model.pt")
+        test_ds = TemporalKGDataset(test_triples, history_map, args.history_size, pad_ent_id, pad_rel_id)
+
+        # 评估 best_model
+        if os.path.exists(best_path):
+            state = torch.load(best_path, map_location=device)
+            model.load_state_dict(state)
+        best_metrics = evaluate_with_scope(model, test_ds, len(ent2id), device, args, filter_map_test, desc="Eval-Test-Best")
+
+        swa_metrics = None
+        if args.use_swa and swa_model is not None:
+            logger.info("Applying SWA weights and updating BN...")
+            swa_model.to(device)
+            update_bn(train_loader, swa_model, device=device)
+            swa_metrics = evaluate_with_scope(swa_model, test_ds, len(ent2id), device, args, filter_map_test, desc="Eval-Test-SWA")
+
+        if swa_metrics is not None and swa_metrics.get("MRR", 0) > best_metrics.get("MRR", 0):
+            logger.info(f"Test (SWA better): {swa_metrics}")
+        else:
+            logger.info(f"Test (Best model): {best_metrics}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--train_path", default="./data/ICEWS14/train.csv")
+    parser.add_argument("--valid_path", default="./data/ICEWS14/valid.csv")
+    parser.add_argument("--test_path",  default="./data/ICEWS14/test.csv")
+    parser.add_argument("--save_dir",   default="./models_final_plus_14")
+    parser.add_argument("--pretrained_ent", default=None)
+    parser.add_argument("--pretrained_rel", default=None)
+
+    # 模型/结构
+    parser.add_argument("--dim", type=int, default=520)
+    parser.add_argument("--qfm_layers", type=int, default=3)
+    parser.add_argument("--history_size", type=int, default=50)
+    parser.add_argument("--short_hist_size", type=int, default=20)
+    parser.add_argument("--long_hist_size", type=int, default=60)
+    parser.add_argument("--history_heads", type=int, default=4)
+    parser.add_argument("--dropout", type=float, default=0.12)
+    parser.add_argument("--rel_dropout", type=float, default=0.0)
+    parser.add_argument("--time_dropout", type=float, default=0.0)
+    parser.add_argument("--hist_attn_dropout", type=float, default=0.12)
+    parser.add_argument("--recency_decay", type=float, default=0.07)
+    parser.add_argument("--hist_mask_dropout", type=float, default=0.0)
+    parser.add_argument("--hist_tf_layers", type=int, default=2)
+    parser.add_argument("--hist_tf_heads", type=int, default=8)
+    parser.add_argument("--hist_tf_dropout", type=float, default=0.1)
+
+    # 训练
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch_size", type=int, default=400)
+    parser.add_argument("--accum_steps", type=int, default=2)
+    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--neg_sample_size", type=int, default=2000)
+    parser.add_argument("--use_san", action="store_true", default=True)
+    parser.add_argument("--san_temp", type=float, default=1.8)
+    parser.add_argument("--label_smoothing", type=float, default=0.01)
+    parser.add_argument("--grad_clip", type=float, default=0.8)
+    parser.add_argument("--use_amp", action="store_true", default=True)
+    parser.add_argument("--use_bf16", action="store_true", default=True)
+    parser.add_argument("--use_compile", action="store_true", default=False)
+
+    parser.add_argument("--loss_type", choices=["bce_san","info_nce"], default="bce_san")
+    parser.add_argument("--nce_temp_pos", type=float, default=0.6)
+    parser.add_argument("--nce_temp_neg", type=float, default=0.95)
+    parser.add_argument("--pos_margin", type=float, default=0.11)
+    parser.add_argument("--neg_margin", type=float, default=0.04)
+
+    parser.add_argument("--use_dual_loss", action="store_true", default=True)
+    parser.add_argument("--dual_alpha", type=float, default=0.3)
+
+    parser.add_argument("--filter_scope", choices=["train_only","train_valid","split_only","all_splits"], default="train_valid")
+
+    parser.add_argument("--num_workers", type=int, default=10)
+    parser.add_argument("--prefetch_factor", type=int, default=4)
+    parser.add_argument("--eval_freq", type=int, default=1)
+    parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--no_inverse", action="store_true")
+    parser.add_argument("--eval_batch_size", type=int, default=256)
+    parser.add_argument("--score_chunk_size", type=int, default=1024)
+
+    parser.add_argument("--use_cosine", action="store_true", default=True)
+    parser.add_argument("--warmup_steps", type=int, default=3000)
+    parser.add_argument("--warmup_ratio", type=float, default=0.1)
+    parser.add_argument("--eta_min_ratio", type=float, default=0.05)
+
+    parser.add_argument("--reg_lambda", type=float, default=5e-4)
+    parser.add_argument("--rel_freq_beta", type=float, default=0.05)
+    parser.add_argument("--ent_freq_alpha", type=float, default=0.15)
+
+    parser.add_argument("--use_ema", action="store_true", default=True)
+    parser.add_argument("--ema_decay", type=float, default=0.995)
+
+    # SWA
+    parser.add_argument("--use_swa", action="store_true", default=True)
+    parser.add_argument("--swa_start_ratio", type=float, default=0.8)
+    parser.add_argument("--swa_freq", type=int, default=1)
+    parser.add_argument("--swa_lr", type=float, default=4e-4)
+
+    # R-Drop
+    parser.add_argument("--use_rdrop", action="store_true", default=False)
+    parser.add_argument("--rdrop_alpha", type=float, default=1.0)
+
+    parser.add_argument("--use_inbatch_neg", action="store_true", default=True)
+    parser.add_argument("--use_aux_rel", action="store_true", default=True)
+    parser.add_argument("--aux_rel_weight", type=float, default=0.05)
+
+    parser.add_argument("--use_fgm", action="store_true", default=False)
+    parser.add_argument("--fgm_epsilon", type=float, default=5e-2)
+
+    parser.add_argument("--contrast_weight", type=float, default=0.1)
+    parser.add_argument("--contrast_temp", type=float, default=0.2)
+
+    # adapters & time
+    parser.add_argument("--use_adapter", action="store_true", default=False)
+    parser.add_argument("--adapter_dim", type=int, default=64)
+    parser.add_argument("--time_fuse", choices=["cat","add"], default="cat")
+    parser.add_argument("--no_sin_time", action="store_true", default=False)
+    parser.add_argument("--trans_weight", type=float, default=0.25)
+
+    parser.add_argument("--adv_neg_temp", type=float, default=1.3)
+    parser.add_argument("--cache_neg_k", type=int, default=48)
+    parser.add_argument("--cache_bucket_size", type=int, default=512)
+    parser.add_argument("--no_cache_share_across_rel", action="store_true")
+
+    parser.add_argument("--curr_pos_margin", type=float, default=None)
+    parser.add_argument("--curr_neg_margin", type=float, default=None)
+    parser.add_argument("--curr_trans_weight", type=float, default=None)
+
+    parser.add_argument("--time_aux_weight", type=float, default=0.01)
+    parser.add_argument("--time_label_smoothing", type=float, default=0.0)
+
+    parser.add_argument("--vocab_from_train_only", action="store_true", default=True)
+
+    # 消融开关
+    parser.add_argument("--disable_qfm", action="store_true", help="Disable QFM module")
+    parser.add_argument("--disable_dtm", action="store_true", help="Disable DTM module")
+    parser.add_argument("--disable_history", action="store_true", help="Disable History module")
+
+    args = parser.parse_args()
+    os.makedirs(args.save_dir, exist_ok=True)
+    main(args)
