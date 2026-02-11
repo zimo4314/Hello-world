@@ -478,6 +478,7 @@ class LTGQ(nn.Module):
         self.event_proj = nn.Sequential(nn.Linear(dim*3, dim), nn.LeakyReLU(0.2))
 
         self.final_ln=nn.LayerNorm(dim)
+        self.final_ln_no_affine = nn.LayerNorm(dim, elementwise_affine=False)
         self.final_proj=nn.Sequential(nn.Linear(dim,dim), nn.LeakyReLU(0.2), nn.Dropout(dropout))
         self.time_gate = nn.Linear(dim*2, dim)
         self.r_time_gate = nn.Linear(dim*2, dim)
@@ -589,15 +590,17 @@ class LTGQ(nn.Module):
         r_emb=self.apply_dropout_mask(r_emb, self.rel_dropout)
         tau=self.apply_dropout_mask(tau, self.time_dropout)
 
-        rt = self.leaky(self.Wr(torch.cat([r_emb, tau], dim=1)))
-        x = torch.tanh(e + rt)
+        # ==================== QFM 消融：必须同时切断 rt 旁路 ====================
+        # 原始: rt = W[r_emb, tau], x = tanh(e + rt)
+        # 问题: r_emb 和 tau 通过 rt 直接注入 x，绕过 QFM 到达 q
+        # 修复: 消融QFM时 rt=0，x=tanh(e)，只保留实体信息
+        if self.disable_qfm:
+            x = torch.tanh(e)
+        else:
+            rt = self.leaky(self.Wr(torch.cat([r_emb, tau], dim=1)))
+            x = torch.tanh(e + rt)
 
         # ==================== QFM 彻底消融 ====================
-        # QFM产出: ei, ri, ti, thetas
-        # ri 下游使用: 门控回退值(×2), score()的trans/rotate打分
-        # ti 下游使用: 门控输入, score()的trans/rotate打分, contrast_proj_t
-        # ei 下游使用: 仅用于thetas计算
-        # 彻底消融: 全部归零，thetas均匀，下游门控回退=0，score的trans/rotate=0
         if self.disable_qfm:
             ei = torch.zeros_like(e)
             ri = torch.zeros_like(r_emb)
@@ -612,9 +615,6 @@ class LTGQ(nn.Module):
             thetas = F.softmax(thetas, dim=1)
 
         # ==================== DTM 彻底消融 ====================
-        # DTM产出: x_o (由c1,c2,c3经thetas加权)
-        # x_o 下游使用: CopyNet的输入, disable_history时直接变q
-        # 彻底消融: x_o归零，CopyNet收到全零输入，历史信息无法注入查询
         if self.disable_dtm:
             x_o = torch.zeros_like(x)
         else:
@@ -623,12 +623,13 @@ class LTGQ(nn.Module):
             x_o = torch.tanh(x_o)
 
         # ==================== 历史依赖模块彻底消融 ====================
-        # 历史模块产出: q (通过TF+CopyNet+双层门控)
-        # 彻底消融: 跳过build_history_vectors, CopyNet, 双层门控全部跳过
-        # q直接从x_o产生, 历史信息完全不参与
-        # 注意: ri,ti保持正常值传给score()用于trans/rotate打分(打分模块不属于历史模块)
+        # 选择 LayerNorm：消融任一模块时使用无 affine 的 LN
+        # 防止 LN 的 bias 让零向量变非零，导致 dot/cos 打分绕过消融
+        _use_ablation_ln = self.disable_qfm or self.disable_dtm or self.disable_history
+        _ln = self.final_ln_no_affine if _use_ablation_ln else self.final_ln
+
         if self.disable_history:
-            q = self.final_proj(self.final_ln(x_o))
+            q = self.final_proj(_ln(x_o))
         else:
             hist_vecs_pool, hist_seq = self.build_history_vectors(h_r,h_o,h_y,h_m,h_d)
             hist_mask = (h_o != self.pad_ent_id).long()
@@ -639,7 +640,7 @@ class LTGQ(nn.Module):
 
             t_gate = torch.sigmoid(self.time_gate(torch.cat([ri, ti], dim=1)))
             q = t_gate * x_hist + (1 - t_gate) * ri
-            q = self.final_proj(self.final_ln(q))
+            q = self.final_proj(_ln(q))
 
         # ==================== 辅助输出（始终执行）====================
         aux_rel_logits = self.aux_rel_head(q) if self.use_aux_rel else None
