@@ -1209,17 +1209,17 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train_path", default="./data/ICEWS14/train.csv")
-    parser.add_argument("--valid_path", default="./data/ICEWS14/valid.csv")
-    parser.add_argument("--test_path",  default="./data/ICEWS14/test.csv")
-    parser.add_argument("--save_dir",   default="./models_final_plus_14")
+    parser.add_argument("--train_path", default="./data/ICEWS05_15/train.csv")
+    parser.add_argument("--valid_path", default="./data/ICEWS05_15/valid.csv")
+    parser.add_argument("--test_path",  default="./data/ICEWS05_15/test.csv")
+    parser.add_argument("--save_dir",   default="./models_final_plus_0515")
     parser.add_argument("--pretrained_ent", default=None)
     parser.add_argument("--pretrained_rel", default=None)
 
     # 模型/结构
-    parser.add_argument("--dim", type=int, default=520)
+    parser.add_argument("--dim", type=int, default=440)
     parser.add_argument("--qfm_layers", type=int, default=3)
-    parser.add_argument("--history_size", type=int, default=50)
+    parser.add_argument("--history_size", type=int, default=60)
     parser.add_argument("--short_hist_size", type=int, default=20)
     parser.add_argument("--long_hist_size", type=int, default=60)
     parser.add_argument("--history_heads", type=int, default=4)
@@ -1234,11 +1234,11 @@ if __name__ == "__main__":
     parser.add_argument("--hist_tf_dropout", type=float, default=0.1)
 
     # 训练
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=400)
+    parser.add_argument("--epochs", type=int, default=0)
+    parser.add_argument("--batch_size", type=int, default=160)
     parser.add_argument("--accum_steps", type=int, default=2)
     parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--neg_sample_size", type=int, default=2000)
+    parser.add_argument("--neg_sample_size", type=int, default=1600)
     parser.add_argument("--use_san", action="store_true", default=True)
     parser.add_argument("--san_temp", type=float, default=1.8)
     parser.add_argument("--label_smoothing", type=float, default=0.01)
